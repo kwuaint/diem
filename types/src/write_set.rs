@@ -5,13 +5,13 @@
 //! path it updates. For each access path, the VM can either give its new value or delete it.
 
 use crate::access_path::AccessPath;
-use failure::prelude::*;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum WriteOp {
     Deletion,
-    Value(Vec<u8>),
+    Value(#[serde(with = "serde_bytes")] Vec<u8>),
 }
 
 impl WriteOp {
@@ -27,7 +27,14 @@ impl WriteOp {
 impl std::fmt::Debug for WriteOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WriteOp::Value(value) => write!(f, "Value({})", String::from_utf8_lossy(value)),
+            WriteOp::Value(value) => write!(
+                f,
+                "Value({})",
+                value
+                    .iter()
+                    .map(|byte| format!("{:02x}", byte))
+                    .collect::<String>()
+            ),
             WriteOp::Deletion => write!(f, "Deletion"),
         }
     }
@@ -41,17 +48,12 @@ pub struct WriteSet(WriteSetMut);
 
 impl WriteSet {
     #[inline]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[inline]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
     #[inline]
-    pub fn iter<'a>(&'a self) -> ::std::slice::Iter<'a, (AccessPath, WriteOp)> {
+    pub fn iter(&self) -> ::std::slice::Iter<'_, (AccessPath, WriteOp)> {
         self.into_iter()
     }
 
@@ -76,11 +78,6 @@ impl WriteSetMut {
 
     pub fn push(&mut self, item: (AccessPath, WriteOp)) {
         self.write_set.push(item);
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.write_set.len()
     }
 
     #[inline]

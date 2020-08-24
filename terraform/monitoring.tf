@@ -3,9 +3,10 @@ data "template_file" "prometheus_yml" {
 
   vars = {
     workspace             = terraform.workspace
-    validators            = join(",", formatlist("%s:%s", aws_instance.validator.*.private_ip, var.peer_ids))
-    fullnodes             = join(",", formatlist("%s:%s", aws_instance.fullnode.*.private_ip, slice(var.fullnode_ids, 0, var.num_fullnodes)))
-    other_nodes           = join(",", ["${aws_instance.monitoring.private_ip}:monitoring", "${aws_instance.faucet.private_ip}:faucet"])
+    validators            = join(",", formatlist("%s:%s", aws_instance.validator.*.private_ip, range(var.num_validators)))
+    fullnodes             = join(",", formatlist("%s:%s", aws_instance.fullnode.*.private_ip, range(var.num_fullnodes)))
+    other_nodes           = join(",", ["${aws_instance.monitoring.private_ip}:monitoring", "${aws_instance.faucet.private_ip}:faucet", "${aws_instance.vault.private_ip}:vault"])
+    vault_ip              = aws_instance.vault.private_ip
     monitoring_private_ip = aws_instance.monitoring.private_ip
   }
 }
@@ -42,6 +43,7 @@ resource "aws_instance" "monitoring" {
   tags = {
     Name      = "${terraform.workspace}-monitoring"
     Role      = "monitoring"
+    Terraform = "testnet"
     Workspace = terraform.workspace
   }
 
@@ -64,12 +66,13 @@ resource "aws_instance" "monitoring" {
 
 resource "aws_ebs_volume" "monitoring" {
   availability_zone = data.aws_availability_zones.available.names[0]
-  size              = 10
+  size              = var.monitoring_ebs_volume
   type              = "standard"
   snapshot_id       = var.monitoring_snapshot
 
   tags = {
     Name      = "${terraform.workspace}-monitoring"
+    Terraform = "testnet"
     Workspace = terraform.workspace
     Role      = "monitoring"
   }
@@ -186,8 +189,9 @@ data "template_file" "ecs_monitoring_definition" {
 
   vars = {
     prometheus_image   = "prom/prometheus:v2.9.2"
+    pushgateway_image  = "prom/pushgateway:v1.2.0"
     alertmanager_image = "prom/alertmanager:v0.17.0"
-    grafana_image      = "grafana/grafana:latest"
+    grafana_image      = "grafana/grafana:6.7.3"
   }
 }
 
@@ -238,6 +242,7 @@ resource "aws_ecs_task_definition" "monitoring" {
 
   tags = {
     Role      = "monitoring"
+    Terraform = "testnet"
     Workspace = terraform.workspace
   }
 }
@@ -252,6 +257,7 @@ resource "aws_ecs_service" "monitoring" {
 
   tags = {
     Role      = "monitoring"
+    Terraform = "testnet"
     Workspace = terraform.workspace
   }
 }

@@ -1,219 +1,62 @@
-use crate::trusted_peers::{deserialize_key, serialize_key};
-use libra_crypto::{
-    ed25519::*,
-    test_utils::TEST_SEED,
-    x25519::{self, X25519StaticPrivateKey, X25519StaticPublicKey},
-    PrivateKey, ValidKeyStringExt,
-};
-use mirai_annotations::verify_unreachable;
-use rand::{rngs::StdRng, SeedableRng};
-use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
+// Copyright (c) The Libra Core Contributors
+// SPDX-License-Identifier: Apache-2.0
 
-#[derive(Debug)]
-#[cfg_attr(any(test, feature = "fuzzing"), derive(Clone))]
-enum PrivateKeyContainer<T> {
-    Present(T),
-    Removed,
-    Absent,
+//! This file implements a KeyPair data structure.
+//!
+//! The point of a KeyPair is to deserialize a private key into a structure
+//! that will only allow the private key to be moved out once
+//! (hence providing good key hygiene)
+//! while allowing access to the public key part forever.
+//!
+//! The public key part is dynamically derived during deserialization,
+//! while ignored during serialization.
+//!
+
+use libra_crypto::PrivateKey;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+/// ConfigKey places a clonable wrapper around PrivateKeys for config purposes only. The only time
+/// configs have keys is either for testing or for low security requirements. Libra recommends that
+/// keys be stored in key managers. If we make keys unclonable, then the configs must be mutable
+/// and that becomes a requirement strictly as a result of supporting test environments, which is
+/// undesirable. Hence this internal wrapper allows for keys to be clonable but only from configs.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ConfigKey<T: PrivateKey + Serialize> {
+    #[serde(bound(deserialize = "T: Deserialize<'de>"))]
+    pub(crate) key: T,
 }
 
-impl<T> PrivateKeyContainer<T>
-where
-    T: PrivateKey,
-{
-    pub fn take(&mut self) -> Option<T> {
-        match self {
-            PrivateKeyContainer::Present(_) => {
-                let key = std::mem::replace(self, PrivateKeyContainer::Removed);
-                match key {
-                    PrivateKeyContainer::Present(priv_key) => Some(priv_key),
-                    _ => verify_unreachable!(
-                        "mem::replace returned value for PrivateKeyContainer different from the one observed right before the call"
-                    ),
-                }
-            }
-            _ => None,
-        }
+impl<T: DeserializeOwned + PrivateKey + Serialize> ConfigKey<T> {
+    pub(crate) fn new(key: T) -> Self {
+        Self { key }
+    }
+
+    pub fn private_key(&self) -> T {
+        self.clone().key
+    }
+
+    pub fn public_key(&self) -> T::PublicKeyMaterial {
+        libra_crypto::PrivateKey::public_key(&self.key)
     }
 }
 
-impl<T> Serialize for PrivateKeyContainer<T>
-where
-    T: Serialize + ValidKeyStringExt,
-{
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            PrivateKeyContainer::Present(key) => serialize_key(key, serializer),
-            _ => serializer.serialize_str(""),
-        }
+impl<T: DeserializeOwned + PrivateKey + Serialize> Clone for ConfigKey<T> {
+    fn clone(&self) -> Self {
+        lcs::from_bytes(&lcs::to_bytes(self).unwrap()).unwrap()
     }
 }
 
-impl<'de, T> Deserialize<'de> for PrivateKeyContainer<T>
-where
-    T: ValidKeyStringExt + DeserializeOwned + 'static,
-{
-    fn deserialize<D>(deserializer: D) -> std::result::Result<PrivateKeyContainer<T>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // Note: Any error in parsing is assumed to be due to the private key being absent.
-        deserialize_key(deserializer)
-            .map(PrivateKeyContainer::Present)
-            .or_else(|_| Ok(PrivateKeyContainer::Absent))
-    }
-}
-
-// NetworkKeyPairs is used to store a node's Network specific keypairs.
-// It is filled via a config file at the moment.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "fuzzing"), derive(Clone))]
-pub struct NetworkKeyPairs {
-    network_signing_private_key: PrivateKeyContainer<Ed25519PrivateKey>,
-    #[serde(serialize_with = "serialize_key")]
-    #[serde(deserialize_with = "deserialize_key")]
-    network_signing_public_key: Ed25519PublicKey,
-
-    #[serde(serialize_with = "serialize_key")]
-    #[serde(deserialize_with = "deserialize_key")]
-    network_identity_private_key: X25519StaticPrivateKey,
-    #[serde(serialize_with = "serialize_key")]
-    #[serde(deserialize_with = "deserialize_key")]
-    network_identity_public_key: X25519StaticPublicKey,
-}
-
-// required for serialization
-impl Default for NetworkKeyPairs {
+#[cfg(test)]
+impl<T: PrivateKey + Serialize + libra_crypto::Uniform> Default for ConfigKey<T> {
     fn default() -> Self {
-        let mut rng = StdRng::from_seed(TEST_SEED);
-        let (net_private_sig, net_public_sig) = compat::generate_keypair(&mut rng);
-        let (private_kex, public_kex) = x25519::compat::generate_keypair(&mut rng);
         Self {
-            network_signing_private_key: PrivateKeyContainer::Present(net_private_sig),
-            network_signing_public_key: net_public_sig,
-            network_identity_private_key: private_kex,
-            network_identity_public_key: public_kex,
+            key: libra_crypto::Uniform::generate_for_testing(),
         }
     }
 }
 
-impl NetworkKeyPairs {
-    // used in testing to fill the structure with test keypairs
-    pub fn load(
-        network_signing_private_key: Ed25519PrivateKey,
-        network_identity_private_key: X25519StaticPrivateKey,
-    ) -> Self {
-        let network_signing_public_key = (&network_signing_private_key).into();
-        let network_identity_public_key = (&network_identity_private_key).into();
-        Self {
-            network_signing_private_key: PrivateKeyContainer::Present(network_signing_private_key),
-            network_signing_public_key,
-            network_identity_private_key,
-            network_identity_public_key,
-        }
+impl<T: PrivateKey + Serialize> PartialEq for ConfigKey<T> {
+    fn eq(&self, other: &Self) -> bool {
+        lcs::to_bytes(&self).unwrap() == lcs::to_bytes(&other).unwrap()
     }
-
-    /// Beware, this destroys the private key from this NodeConfig
-    pub fn take_network_signing_private(&mut self) -> Option<Ed25519PrivateKey> {
-        self.network_signing_private_key.take()
-    }
-
-    pub fn get_network_identity_private(&self) -> X25519StaticPrivateKey {
-        self.network_identity_private_key.clone()
-    }
-
-    pub fn get_network_identity_public(&self) -> &X25519StaticPublicKey {
-        &self.network_identity_public_key
-    }
-
-    // getters for keypairs
-    pub fn get_network_identity_keypair(&self) -> (X25519StaticPrivateKey, X25519StaticPublicKey) {
-        (
-            self.get_network_identity_private(),
-            self.get_network_identity_public().clone(),
-        )
-    }
-}
-
-// ConsensusKeyPair is used to store a validator's consensus keypair.
-// It is filled via a config file at the moment.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "fuzzing"), derive(Clone))]
-pub struct ConsensusKeyPair {
-    consensus_private_key: PrivateKeyContainer<Ed25519PrivateKey>,
-    #[serde(serialize_with = "serialize_opt_key")]
-    #[serde(deserialize_with = "deserialize_opt_key")]
-    consensus_public_key: Option<Ed25519PublicKey>,
-}
-
-// required for serialization
-impl Default for ConsensusKeyPair {
-    fn default() -> Self {
-        let mut rng = StdRng::from_seed(TEST_SEED);
-        let (consensus_private_sig, consensus_public_sig) = compat::generate_keypair(&mut rng);
-        Self {
-            consensus_private_key: PrivateKeyContainer::Present(consensus_private_sig),
-            consensus_public_key: Some(consensus_public_sig),
-        }
-    }
-}
-
-impl ConsensusKeyPair {
-    // used in testing to fill the structure with test keypairs
-    pub fn load(consensus_private_key: Option<Ed25519PrivateKey>) -> Self {
-        let (consensus_private_key, consensus_public_key) = {
-            match consensus_private_key {
-                Some(private_key) => {
-                    let public_key = (&private_key).into();
-                    (PrivateKeyContainer::Present(private_key), Some(public_key))
-                }
-                None => (PrivateKeyContainer::Absent, None),
-            }
-        };
-        Self {
-            consensus_private_key,
-            consensus_public_key,
-        }
-    }
-
-    /// Beware, this destroys the private key from this NodeConfig
-    pub fn take_consensus_private(&mut self) -> Option<Ed25519PrivateKey> {
-        self.consensus_private_key.take()
-    }
-
-    pub fn is_present(&self) -> bool {
-        match self.consensus_private_key {
-            PrivateKeyContainer::Present(_) => true,
-            _ => false,
-        }
-    }
-}
-
-pub fn serialize_opt_key<S, K>(opt_key: &Option<K>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-    K: Serialize + ValidKeyStringExt,
-{
-    opt_key
-        .as_ref()
-        .map_or(Ok("".to_string()), |key| {
-            key.to_encoded_string()
-                .map_err(<S::Error as serde::ser::Error>::custom)
-        })
-        .and_then(|str| serializer.serialize_str(&str[..]))
-}
-
-pub fn deserialize_opt_key<'de, D, K>(deserializer: D) -> Result<Option<K>, D::Error>
-where
-    D: Deserializer<'de>,
-    K: ValidKeyStringExt + DeserializeOwned + 'static,
-{
-    let encoded_key: String = Deserialize::deserialize(deserializer)?;
-
-    ValidKeyStringExt::from_encoded_string(&encoded_key)
-        .map_err(<D::Error as serde::de::Error>::custom)
-        .map(Some)
 }

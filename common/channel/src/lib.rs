@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! Provides an mpsc (multi-producer single-consumer) channel wrapped in an
 //! [`IntGauge`](libra_metrics::IntGauge)
 
@@ -12,6 +14,7 @@ use futures::{
 };
 use libra_logger::prelude::*;
 use libra_metrics::IntGauge;
+use once_cell::sync::Lazy;
 use std::{
     pin::Pin,
     time::{Duration, Instant},
@@ -177,10 +180,8 @@ pub fn new_with_timeout<T>(
     )
 }
 
-lazy_static::lazy_static! {
-    pub static ref TEST_COUNTER: IntGauge =
-        IntGauge::new("TEST_COUNTER", "Counter of network tests").unwrap();
-}
+pub static TEST_COUNTER: Lazy<IntGauge> =
+    Lazy::new(|| IntGauge::new("TEST_COUNTER", "Counter of network tests").unwrap());
 
 pub fn new_test<T>(size: usize) -> (Sender<T>, Receiver<T>) {
     new(size, &TEST_COUNTER)

@@ -1,20 +1,38 @@
-use crate::{aws::Aws, instance::Instance};
-use failure::{self, prelude::*};
+// Copyright (c) The Libra Core Contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#![forbid(unsafe_code)]
+
+use crate::instance::{Instance, ValidatorGroup};
+use config_builder::ValidatorConfig;
+use libra_crypto::{
+    ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
+    test_utils::KeyPair,
+};
+use libra_types::{chain_id::ChainId, waypoint::Waypoint};
 use rand::prelude::*;
-use rusoto_ec2::{DescribeInstancesRequest, Ec2, Filter, Tag};
-use std::collections::HashMap;
-use std::{thread, time::Duration};
+use reqwest::Client;
+use std::convert::TryInto;
 
 #[derive(Clone)]
 pub struct Cluster {
     // guaranteed non-empty
-    instances: Vec<Instance>,
-    prometheus_ip: Option<String>,
-    mint_file: String,
+    validator_instances: Vec<Instance>,
+    fullnode_instances: Vec<Instance>,
+    lsr_instances: Vec<Instance>,
+    vault_instances: Vec<Instance>,
+    mint_key_pair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey>,
+    waypoint: Option<Waypoint>,
+    pub chain_id: ChainId,
 }
 
 impl Cluster {
-    pub fn from_host_port(peers: Vec<(String, u32)>, mint_file: &str) -> Self {
+    pub fn from_host_port(
+        peers: Vec<(String, u32, Option<u32>)>,
+        mint_file: &str,
+        chain_id: ChainId,
+    ) -> Self {
+        let http_client = Client::new();
         let instances: Vec<Instance> = peers
             .into_iter()
             .map(|host_port| {
@@ -22,119 +40,134 @@ impl Cluster {
                     format!("{}:{}", &host_port.0, host_port.1), /* short_hash */
                     host_port.0,
                     host_port.1,
+                    host_port.2,
+                    http_client.clone(),
                 )
             })
             .collect();
+        let mint_key: Ed25519PrivateKey = generate_key::load_key(mint_file);
+        let mint_key_pair = KeyPair::from(mint_key);
         Self {
-            instances,
-            prometheus_ip: None,
-            mint_file: mint_file.to_string(),
+            validator_instances: instances,
+            fullnode_instances: vec![],
+            lsr_instances: vec![],
+            vault_instances: vec![],
+            mint_key_pair,
+            waypoint: None,
+            chain_id,
         }
     }
 
-    pub fn discover(aws: &Aws, mint_file: &str) -> failure::Result<Self> {
-        let mut instances = vec![];
-        let mut next_token = None;
-        let mut retries_left = 10;
-        let mut prometheus_ip: Option<String> = None;
-        loop {
-            let filters = vec![
-                Filter {
-                    name: Some("tag:Workspace".into()),
-                    values: Some(vec![aws.workplace().clone()]),
-                },
-                Filter {
-                    name: Some("instance-state-name".into()),
-                    values: Some(vec!["running".into()]),
-                },
-            ];
-            let result = aws
-                .ec2()
-                .describe_instances(DescribeInstancesRequest {
-                    filters: Some(filters),
-                    max_results: Some(1000),
-                    dry_run: None,
-                    instance_ids: None,
-                    next_token: next_token.clone(),
-                })
-                .sync();
-            let result = match result {
-                Err(e) => {
-                    println!(
-                        "Failed to describe aws instances: {:?}, retries left: {}",
-                        e, retries_left
-                    );
-                    thread::sleep(Duration::from_secs(1));
-                    if retries_left == 0 {
-                        panic!("Last attempt to describe instances failed");
-                    }
-                    retries_left -= 1;
-                    continue;
-                }
-                Ok(r) => r,
-            };
-            for reservation in result.reservations.expect("no reservations") {
-                for aws_instance in reservation.instances.expect("no instances") {
-                    let ip = aws_instance
-                        .private_ip_address
-                        .expect("Instance does not have private IP address");
-                    let tags = aws_instance.tags.expect("Instance does not have tags");
-                    let role = parse_tags(tags);
-                    match role {
-                        InstanceRole::Prometheus => {
-                            prometheus_ip = Some(ip);
-                        }
-                        InstanceRole::Peer(peer_id) => {
-                            let short_hash = peer_id[..8].into();
-                            instances.push(Instance::new(short_hash, ip, 8000));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            next_token = result.next_token;
-            if next_token.is_none() {
-                break;
-            }
-        }
-        ensure!(
-            !instances.is_empty(),
-            "No instances were discovered for cluster"
-        );
-        let prometheus_ip =
-            prometheus_ip.ok_or_else(|| format_err!("Prometheus was not found in workplace"))?;
-        Ok(Self {
-            instances,
-            prometheus_ip: Some(prometheus_ip),
-            mint_file: mint_file.to_string(),
-        })
+    fn get_mint_key_pair() -> KeyPair<Ed25519PrivateKey, Ed25519PublicKey> {
+        let seed = "1337133713371337133713371337133713371337133713371337133713371337";
+        let seed = hex::decode(seed).expect("Invalid hex in seed.");
+        let seed = seed[..32].try_into().expect("Invalid seed");
+        let mut validator_config = ValidatorConfig::new();
+        validator_config.seed = seed;
+        let (mint_key, _) = validator_config.build_libra_root_key();
+        KeyPair::from(mint_key)
     }
 
-    pub fn random_instance(&self) -> Instance {
+    fn get_mint_key_pair_from_file(
+        mint_file: &str,
+    ) -> KeyPair<Ed25519PrivateKey, Ed25519PublicKey> {
+        let mint_key: Ed25519PrivateKey = generate_key::load_key(mint_file);
+        KeyPair::from(mint_key)
+    }
+
+    pub fn new(
+        validator_instances: Vec<Instance>,
+        fullnode_instances: Vec<Instance>,
+        lsr_instances: Vec<Instance>,
+        vault_instances: Vec<Instance>,
+        waypoint: Option<Waypoint>,
+    ) -> Self {
+        let mint_key_pair = if waypoint.is_some() {
+            Self::get_mint_key_pair_from_file("/tmp/mint.key")
+        } else {
+            Self::get_mint_key_pair()
+        };
+        Self {
+            validator_instances,
+            fullnode_instances,
+            lsr_instances,
+            vault_instances,
+            mint_key_pair,
+            waypoint,
+            chain_id: ChainId::test(),
+        }
+    }
+
+    pub fn random_validator_instance(&self) -> Instance {
         let mut rnd = rand::thread_rng();
-        self.instances.choose(&mut rnd).unwrap().clone()
+        self.validator_instances
+            .choose(&mut rnd)
+            .expect("random_validator_instance requires non-empty validator_instances")
+            .clone()
     }
 
-    pub fn instances(&self) -> &Vec<Instance> {
-        &self.instances
+    pub fn validator_instances(&self) -> &[Instance] {
+        &self.validator_instances
     }
 
-    pub fn into_instances(self) -> Vec<Instance> {
-        self.instances
+    pub fn random_fullnode_instance(&self) -> Instance {
+        let mut rnd = rand::thread_rng();
+        self.fullnode_instances
+            .choose(&mut rnd)
+            .expect("random_full_node_instance requires non-empty fullnode_instances")
+            .clone()
     }
 
-    pub fn prometheus_ip(&self) -> Option<&String> {
-        self.prometheus_ip.as_ref()
+    pub fn fullnode_instances(&self) -> &[Instance] {
+        &self.fullnode_instances
     }
 
-    pub fn mint_file(&self) -> &str {
-        &self.mint_file
+    pub fn lsr_instances(&self) -> &[Instance] {
+        &self.lsr_instances
     }
 
-    pub fn get_instance(&self, name: &str) -> Option<&Instance> {
-        self.instances
+    pub fn vault_instances(&self) -> &[Instance] {
+        &self.vault_instances
+    }
+
+    pub fn all_instances(&self) -> impl Iterator<Item = &Instance> {
+        self.validator_instances
             .iter()
-            .find(|instance| instance.short_hash() == name)
+            .chain(self.fullnode_instances.iter())
+            .chain(self.lsr_instances.iter())
+            .chain(self.vault_instances.iter())
+    }
+
+    pub fn validator_and_fullnode_instances(&self) -> impl Iterator<Item = &Instance> {
+        self.validator_instances
+            .iter()
+            .chain(self.fullnode_instances.iter())
+    }
+
+    pub fn into_validator_instances(self) -> Vec<Instance> {
+        self.validator_instances
+    }
+
+    pub fn into_fullnode_instances(self) -> Vec<Instance> {
+        self.fullnode_instances
+    }
+
+    pub fn into_lsr_instances(self) -> Vec<Instance> {
+        self.lsr_instances
+    }
+
+    pub fn into_vault_instances(self) -> Vec<Instance> {
+        self.vault_instances
+    }
+
+    pub fn mint_key_pair(&self) -> &KeyPair<Ed25519PrivateKey, Ed25519PublicKey> {
+        &self.mint_key_pair
+    }
+
+    pub fn get_validator_instance(&self, name: &str) -> Option<&Instance> {
+        self.validator_instances
+            .iter()
+            .find(|instance| instance.peer_name() == name)
     }
 
     /// Splits this cluster into two
@@ -142,57 +175,109 @@ impl Cluster {
     /// Returns tuple of two clusters:
     /// First element in tuple contains cluster with c random instances from self
     /// Second element in tuple contains cluster with remaining instances from self
-    pub fn split_n_random(&self, c: usize) -> (Self, Self) {
-        assert!(c <= self.instances.len());
+    pub fn split_n_validators_random(&self, c: usize) -> (Self, Self) {
+        assert!(c <= self.validator_instances.len());
         let mut rng = ThreadRng::default();
         let mut sub = vec![];
-        let mut rem = self.instances.clone();
+        let mut rem = self.validator_instances.clone();
         for _ in 0..c {
             let idx_remove = rng.gen_range(0, rem.len());
             let instance = rem.remove(idx_remove);
             sub.push(instance);
         }
-        (self.new_sub_cluster(sub), self.new_sub_cluster(rem))
+        (
+            self.new_validator_sub_cluster(sub),
+            self.new_validator_sub_cluster(rem),
+        )
     }
 
-    fn new_sub_cluster(&self, instances: Vec<Instance>) -> Self {
+    pub fn split_n_fullnodes_random(&self, c: usize) -> (Self, Self) {
+        assert!(c <= self.fullnode_instances.len());
+        let mut rng = ThreadRng::default();
+        let mut sub = vec![];
+        let mut rem = self.fullnode_instances.clone();
+        for _ in 0..c {
+            let idx_remove = rng.gen_range(0, rem.len());
+            let instance = rem.remove(idx_remove);
+            sub.push(instance);
+        }
+        (
+            self.new_fullnode_sub_cluster(sub),
+            self.new_fullnode_sub_cluster(rem),
+        )
+    }
+
+    fn new_validator_sub_cluster(&self, instances: Vec<Instance>) -> Self {
         Cluster {
-            instances,
-            prometheus_ip: self.prometheus_ip.clone(),
-            mint_file: self.mint_file.clone(),
+            validator_instances: instances,
+            fullnode_instances: vec![],
+            lsr_instances: vec![],
+            vault_instances: vec![],
+            mint_key_pair: self.mint_key_pair.clone(),
+            waypoint: self.waypoint,
+            chain_id: ChainId::test(),
         }
     }
 
-    pub fn sub_cluster(&self, ids: Vec<String>) -> Cluster {
+    fn new_fullnode_sub_cluster(&self, instances: Vec<Instance>) -> Self {
+        Cluster {
+            validator_instances: vec![],
+            fullnode_instances: instances,
+            lsr_instances: vec![],
+            vault_instances: vec![],
+            mint_key_pair: self.mint_key_pair.clone(),
+            waypoint: self.waypoint,
+            chain_id: ChainId::test(),
+        }
+    }
+
+    pub fn validator_sub_cluster(&self, ids: Vec<String>) -> Cluster {
         let mut instances = Vec::with_capacity(ids.len());
         for id in ids {
-            let instance = self.get_instance(&id);
+            let instance = self.get_validator_instance(&id);
             match instance {
                 Some(instance) => instances.push(instance.clone()),
                 None => panic!("Can not make sub_cluster: instance {} is not found", id),
             }
         }
         assert!(!instances.is_empty(), "No instances for subcluster");
-        self.new_sub_cluster(instances)
+        self.new_validator_sub_cluster(instances)
     }
-}
 
-fn parse_tags(tags: Vec<Tag>) -> InstanceRole {
-    let mut map: HashMap<_, _> = tags.into_iter().map(|tag| (tag.key, tag.value)).collect();
-    let role = map.remove(&Some("Role".to_string()));
-    if role == Some(Some("validator".to_string())) {
-        let peer_id = map.remove(&Some("PeerId".to_string()));
-        let peer_id = peer_id.expect("Validator instance without PeerId");
-        let peer_id = peer_id.expect("PeerId tag without value");
-        return InstanceRole::Peer(peer_id);
-    } else if role == Some(Some("monitoring".to_string())) {
-        return InstanceRole::Prometheus;
+    pub fn find_instance_by_pod(&self, pod: &str) -> Option<&Instance> {
+        self.validator_and_fullnode_instances()
+            .find(|i| i.peer_name() == pod)
     }
-    InstanceRole::Unknown
-}
 
-enum InstanceRole {
-    Peer(String),
-    Prometheus,
-    Unknown,
+    pub fn instances_for_group(
+        &self,
+        validator_group: ValidatorGroup,
+    ) -> impl Iterator<Item = &Instance> {
+        self.all_instances()
+            .filter(move |v| v.validator_group() == validator_group)
+    }
+
+    pub fn lsr_instances_for_validators(&self, validators: &[Instance]) -> Vec<Instance> {
+        validators
+            .iter()
+            .filter_map(|l| {
+                self.lsr_instances
+                    .iter()
+                    .find(|x| l.validator_group() == x.validator_group())
+                    .cloned()
+            })
+            .collect()
+    }
+
+    pub fn vault_instances_for_validators(&self, validators: &[Instance]) -> Vec<Instance> {
+        validators
+            .iter()
+            .filter_map(|v| {
+                self.vault_instances
+                    .iter()
+                    .find(|x| v.validator_group() == x.validator_group())
+                    .cloned()
+            })
+            .collect()
+    }
 }

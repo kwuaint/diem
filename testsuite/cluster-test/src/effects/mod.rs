@@ -1,21 +1,28 @@
-mod packet_loss;
-mod reboot;
-mod remove_network_effects;
-mod stop_container;
+// Copyright (c) The Libra Core Contributors
+// SPDX-License-Identifier: Apache-2.0
 
-use failure;
-pub use packet_loss::PacketLoss;
-pub use reboot::Reboot;
-pub use remove_network_effects::RemoveNetworkEffects;
+#![forbid(unsafe_code)]
+
+use anyhow::Result;
+use async_trait::async_trait;
+use futures::future::try_join_all;
 use std::fmt::Display;
-pub use stop_container::StopContainer;
 
-pub trait Action: Display + Send {
-    fn apply(&self) -> failure::Result<()>;
-    fn is_complete(&self) -> bool;
+pub mod network_delay;
+pub mod packet_loss;
+
+#[async_trait]
+pub trait Effect: Display {
+    async fn activate(&mut self) -> Result<()>;
+    async fn deactivate(&mut self) -> Result<()>;
 }
 
-pub trait Effect: Display + Send {
-    fn activate(&self) -> failure::Result<()>;
-    fn deactivate(&self) -> failure::Result<()>;
+pub async fn activate_all<T: Effect>(effects: &mut Vec<T>) -> Result<()> {
+    try_join_all(effects.iter_mut().map(Effect::activate)).await?;
+    Ok(())
+}
+
+pub async fn deactivate_all<T: Effect>(effects: &mut Vec<T>) -> Result<()> {
+    try_join_all(effects.iter_mut().map(Effect::deactivate)).await?;
+    Ok(())
 }

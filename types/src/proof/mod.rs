@@ -8,27 +8,31 @@ pub mod position;
 pub mod proptest_proof;
 
 #[cfg(test)]
-#[path = "unit_tests/proof_test.rs"]
-mod proof_test;
+mod unit_tests;
 
 use crate::{
     ledger_info::LedgerInfo,
     transaction::{TransactionInfo, Version},
 };
-use failure::prelude::*;
+use anyhow::{ensure, Result};
 use libra_crypto::{
     hash::{
         CryptoHash, CryptoHasher, EventAccumulatorHasher, SparseMerkleInternalHasher,
-        SparseMerkleLeafHasher, TestOnlyHasher, TransactionAccumulatorHasher,
+        TestOnlyHasher, TransactionAccumulatorHasher,
     },
     HashValue,
 };
+use libra_crypto_derive::CryptoHasher;
+#[cfg(any(test, feature = "fuzzing"))]
+use proptest_derive::Arbitrary;
+use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 
 pub use self::definition::{
-    AccountStateProof, AccumulatorConsistencyProof, AccumulatorProof, AccumulatorRangeProof,
-    EventAccumulatorProof, EventProof, SparseMerkleProof, TransactionAccumulatorProof,
-    TransactionAccumulatorRangeProof, TransactionListProof, TransactionProof,
+    AccountStateProof, AccumulatorConsistencyProof, AccumulatorExtensionProof, AccumulatorProof,
+    AccumulatorRangeProof, EventAccumulatorProof, EventProof, SparseMerkleProof,
+    SparseMerkleRangeProof, TransactionAccumulatorProof, TransactionAccumulatorRangeProof,
+    TransactionInfoWithProof, TransactionListProof,
 };
 
 #[cfg(any(test, feature = "fuzzing"))]
@@ -79,8 +83,8 @@ impl<H: CryptoHasher> CryptoHash for MerkleTreeInternalNode<H> {
 
     fn hash(&self) -> HashValue {
         let mut state = Self::Hasher::default();
-        state.write(self.left_child.as_ref());
-        state.write(self.right_child.as_ref());
+        state.update(self.left_child.as_ref());
+        state.update(self.right_child.as_ref());
         state.finish()
     }
 }
@@ -90,6 +94,8 @@ pub type TransactionAccumulatorInternalNode = MerkleTreeInternalNode<Transaction
 pub type EventAccumulatorInternalNode = MerkleTreeInternalNode<EventAccumulatorHasher>;
 pub type TestAccumulatorInternalNode = MerkleTreeInternalNode<TestOnlyHasher>;
 
+#[derive(Clone, Copy, CryptoHasher, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct SparseMerkleLeafNode {
     key: HashValue,
     value_hash: HashValue,
@@ -99,15 +105,23 @@ impl SparseMerkleLeafNode {
     pub fn new(key: HashValue, value_hash: HashValue) -> Self {
         SparseMerkleLeafNode { key, value_hash }
     }
+
+    pub fn key(&self) -> HashValue {
+        self.key
+    }
+
+    pub fn value_hash(&self) -> HashValue {
+        self.value_hash
+    }
 }
 
 impl CryptoHash for SparseMerkleLeafNode {
-    type Hasher = SparseMerkleLeafHasher;
+    type Hasher = SparseMerkleLeafNodeHasher;
 
     fn hash(&self) -> HashValue {
         let mut state = Self::Hasher::default();
-        state.write(self.key.as_ref());
-        state.write(self.value_hash.as_ref());
+        state.update(self.key.as_ref());
+        state.update(self.value_hash.as_ref());
         state.finish()
     }
 }

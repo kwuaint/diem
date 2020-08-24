@@ -7,7 +7,7 @@ use futures::{
     task::{noop_waker, Context, Poll},
     FutureExt, SinkExt, StreamExt,
 };
-use rusty_fork::{rusty_fork_id, rusty_fork_test, rusty_fork_test_name};
+use rusty_fork::rusty_fork_test;
 use std::{thread, time::Duration};
 
 #[test]
@@ -57,7 +57,7 @@ fn test_send_backpressure_multi_senders() {
     block_on(tx1.send(1)).unwrap();
     assert_eq!(TEST_COUNTER.get(), 1);
 
-    let mut tx2 = tx1.clone();
+    let mut tx2 = tx1;
     let mut task = tx2.send(2);
     assert_eq!(task.poll_unpin(&mut cx), Poll::Pending);
     let item = block_on(rx.next()).unwrap();

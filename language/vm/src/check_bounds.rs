@@ -2,529 +2,522 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    errors::{append_err_info, bounds_error, bytecode_offset_err, verification_error},
+    errors::{
+        bounds_error, offset_out_of_bounds as offset_out_of_bounds_error, verification_error,
+        PartialVMError, PartialVMResult,
+    },
     file_format::{
-        Bytecode, CodeUnit, CompiledModuleMut, FieldDefinition, FunctionDefinition, FunctionHandle,
-        FunctionSignature, Kind, LocalsSignature, LocalsSignatureIndex, ModuleHandle,
-        SignatureToken, StructDefinition, StructFieldInformation, StructHandle, TypeSignature,
+        Bytecode, CodeOffset, CompiledModuleMut, Constant, FieldHandle, FieldInstantiation,
+        FunctionDefinition, FunctionDefinitionIndex, FunctionHandle, FunctionInstantiation,
+        ModuleHandle, Signature, SignatureToken, StructDefInstantiation, StructDefinition,
+        StructFieldInformation, StructHandle, TableIndex,
     },
     internals::ModuleIndex,
     IndexKind,
 };
-use libra_types::vm_error::{StatusCode, VMStatus};
+use move_core_types::vm_status::StatusCode;
+use std::u8;
 
 pub struct BoundsChecker<'a> {
     module: &'a CompiledModuleMut,
+    current_function: Option<FunctionDefinitionIndex>,
 }
 
 impl<'a> BoundsChecker<'a> {
-    pub fn new(module: &'a CompiledModuleMut) -> Self {
-        Self { module }
-    }
-
-    pub fn verify(self) -> Vec<VMStatus> {
-        let mut errors: Vec<Vec<_>> = vec![];
-
-        // A module (or script) must always have at least one module handle. (For modules the first
-        // handle should be the same as the sender -- the bytecode verifier is unaware of
-        // transactions so it does not perform this check.
-        if self.module.module_handles.is_empty() {
+    pub fn verify(module: &'a CompiledModuleMut) -> PartialVMResult<()> {
+        let mut bounds_check = Self {
+            module,
+            current_function: None,
+        };
+        // TODO: this will not be true once we change CompiledScript and remove the
+        // FunctionDefinition for `main`
+        if bounds_check.module.module_handles.is_empty() {
             let status =
-                verification_error(IndexKind::ModuleHandle, 0, StatusCode::NO_MODULE_HANDLES);
-            errors.push(vec![status]);
+                verification_error(StatusCode::NO_MODULE_HANDLES, IndexKind::ModuleHandle, 0);
+            return Err(status);
         }
 
-        errors.push(Self::verify_pool(
-            IndexKind::ModuleHandle,
-            self.module.module_handles.iter(),
-            self.module,
-        ));
-        errors.push(Self::verify_pool(
-            IndexKind::StructHandle,
-            self.module.struct_handles.iter(),
-            self.module,
-        ));
-        errors.push(Self::verify_pool(
-            IndexKind::FunctionHandle,
-            self.module.function_handles.iter(),
-            self.module,
-        ));
-        errors.push(Self::verify_pool(
-            IndexKind::StructDefinition,
-            self.module.struct_defs.iter(),
-            self.module,
-        ));
-        errors.push(Self::verify_pool(
-            IndexKind::FieldDefinition,
-            self.module.field_defs.iter(),
-            self.module,
-        ));
-        errors.push(Self::verify_pool(
-            IndexKind::FunctionDefinition,
-            self.module.function_defs.iter(),
-            self.module,
-        ));
-        errors.push(Self::verify_pool(
-            IndexKind::FunctionSignature,
-            self.module.function_signatures.iter(),
-            self.module,
-        ));
-
-        // Check the struct handle indices in locals signatures.
-        // Type parameter indices are checked later in a separate pass.
-        errors.push(
-            self.module
-                .locals_signatures
-                .iter()
-                .enumerate()
-                .flat_map(|(idx, locals)| {
-                    locals
-                        .check_struct_handles(&self.module.struct_handles)
-                        .into_iter()
-                        .map(move |err| append_err_info(err, IndexKind::LocalsSignature, idx))
-                })
-                .collect(),
-        );
-
-        // Check the struct handle indices in type signatures.
-        errors.push(
-            self.module
-                .type_signatures
-                .iter()
-                .enumerate()
-                .flat_map(|(idx, ty)| {
-                    ty.check_struct_handles(&self.module.struct_handles)
-                        .into_iter()
-                        .map(move |err| append_err_info(err, IndexKind::TypeSignature, idx))
-                })
-                .collect(),
-        );
-
-        let errors: Vec<_> = errors.into_iter().flatten().collect();
-        if !errors.is_empty() {
-            return errors;
+        for signature in &bounds_check.module.signatures {
+            bounds_check.check_signature(signature)?
         }
+        for constant in &bounds_check.module.constant_pool {
+            bounds_check.check_constant(constant)?
+        }
+        for module_handle in &bounds_check.module.module_handles {
+            bounds_check.check_module_handle(module_handle)?
+        }
+        for struct_handle in &bounds_check.module.struct_handles {
+            bounds_check.check_struct_handle(struct_handle)?
+        }
+        for function_handle in &bounds_check.module.function_handles {
+            bounds_check.check_function_handle(function_handle)?
+        }
+        for field_handle in &bounds_check.module.field_handles {
+            bounds_check.check_field_handle(field_handle)?
+        }
+        for struct_instantiation in &bounds_check.module.struct_def_instantiations {
+            bounds_check.check_struct_instantiation(struct_instantiation)?
+        }
+        for function_instantiation in &bounds_check.module.function_instantiations {
+            bounds_check.check_function_instantiation(function_instantiation)?
+        }
+        for field_instantiation in &bounds_check.module.field_instantiations {
+            bounds_check.check_field_instantiation(field_instantiation)?
+        }
+        for struct_def in &bounds_check.module.struct_defs {
+            bounds_check.check_struct_def(struct_def)?
+        }
+        for (function_def_idx, function_def) in bounds_check.module.function_defs.iter().enumerate()
+        {
+            bounds_check.check_function_def(function_def_idx, function_def)?
+        }
+        Ok(())
+    }
 
-        // Fields and function bodies need to be done once the rest of the module is validated.
-        let errors_type_signatures = self.module.field_defs.iter().flat_map(|field_def| {
-            let sh = &self.module.struct_handles[field_def.struct_.0 as usize];
-            let sig = &self.module.type_signatures[field_def.signature.0 as usize];
+    fn check_module_handle(&self, module_handle: &ModuleHandle) -> PartialVMResult<()> {
+        check_bounds_impl(&self.module.address_identifiers, module_handle.address)?;
+        check_bounds_impl(&self.module.identifiers, module_handle.name)
+    }
 
-            sig.check_type_parameters(sh.type_formals.len())
-        });
+    fn check_struct_handle(&self, struct_handle: &StructHandle) -> PartialVMResult<()> {
+        check_bounds_impl(&self.module.module_handles, struct_handle.module)?;
+        check_bounds_impl(&self.module.identifiers, struct_handle.name)
+    }
 
-        let errors_code_units = self.module.function_defs.iter().flat_map(|function_def| {
-            if function_def.is_native() {
-                vec![]
-            } else {
-                let fh = &self.module.function_handles[function_def.function.0 as usize];
-                let sig = &self.module.function_signatures[fh.signature.0 as usize];
-                function_def.code.check_bounds((self.module, sig))
+    fn check_function_handle(&self, function_handle: &FunctionHandle) -> PartialVMResult<()> {
+        check_bounds_impl(&self.module.module_handles, function_handle.module)?;
+        check_bounds_impl(&self.module.identifiers, function_handle.name)?;
+        check_bounds_impl(&self.module.signatures, function_handle.parameters)?;
+        check_bounds_impl(&self.module.signatures, function_handle.return_)?;
+        // function signature type paramters must be in bounds to the function type parameters
+        let type_param_count = function_handle.type_parameters.len();
+        if let Some(sig) = self
+            .module
+            .signatures
+            .get(function_handle.parameters.into_index())
+        {
+            for ty in &sig.0 {
+                self.check_type_parameter(ty, type_param_count)?
             }
-        });
-
-        errors_type_signatures.chain(errors_code_units).collect()
+        }
+        if let Some(sig) = self
+            .module
+            .signatures
+            .get(function_handle.return_.into_index())
+        {
+            for ty in &sig.0 {
+                self.check_type_parameter(ty, type_param_count)?
+            }
+        }
+        Ok(())
     }
 
-    #[inline]
-    fn verify_pool<Context, Item: 'a>(
-        kind: IndexKind,
-        iter: impl Iterator<Item = &'a Item>,
-        context: Context,
-    ) -> Vec<VMStatus>
-    where
-        Context: Copy,
-        Item: BoundsCheck<Context>,
-    {
-        iter.enumerate()
-            .flat_map(move |(idx, elem)| {
-                elem.check_bounds(context)
-                    .into_iter()
-                    .map(move |err| append_err_info(err, kind, idx))
-            })
-            .collect()
+    fn check_field_handle(&self, field_handle: &FieldHandle) -> PartialVMResult<()> {
+        check_bounds_impl(&self.module.struct_defs, field_handle.owner)?;
+        // field offset must be in bounds, struct def just checked above must exist
+        if let Some(struct_def) = &self.module.struct_defs.get(field_handle.owner.into_index()) {
+            let fields_count = match &struct_def.field_information {
+                StructFieldInformation::Native => 0,
+                StructFieldInformation::Declared(fields) => fields.len(),
+            };
+            if field_handle.field as usize >= fields_count {
+                return Err(bounds_error(
+                    StatusCode::INDEX_OUT_OF_BOUNDS,
+                    IndexKind::MemberCount,
+                    field_handle.field,
+                    fields_count,
+                ));
+            }
+        }
+        Ok(())
     }
-}
 
-pub trait BoundsCheck<Context: Copy> {
-    fn check_bounds(&self, context: Context) -> Vec<VMStatus>;
-}
-
-#[inline]
-fn check_bounds_impl<T, I>(pool: &[T], idx: I) -> Option<VMStatus>
-where
-    I: ModuleIndex,
-{
-    let idx = idx.into_index();
-    let len = pool.len();
-    if idx >= len {
-        let status = bounds_error(I::KIND, idx, len, StatusCode::INDEX_OUT_OF_BOUNDS);
-        Some(status)
-    } else {
-        None
-    }
-}
-
-#[inline]
-fn check_code_unit_bounds_impl<T, I>(pool: &[T], bytecode_offset: usize, idx: I) -> Vec<VMStatus>
-where
-    I: ModuleIndex,
-{
-    let idx = idx.into_index();
-    let len = pool.len();
-    if idx >= len {
-        let status = bytecode_offset_err(
-            I::KIND,
-            idx,
-            len,
-            bytecode_offset,
-            StatusCode::INDEX_OUT_OF_BOUNDS,
-        );
-        vec![status]
-    } else {
-        vec![]
-    }
-}
-
-impl BoundsCheck<&CompiledModuleMut> for ModuleHandle {
-    #[inline]
-    fn check_bounds(&self, module: &CompiledModuleMut) -> Vec<VMStatus> {
-        vec![
-            check_bounds_impl(&module.address_pool, self.address),
-            check_bounds_impl(&module.identifiers, self.name),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
-    }
-}
-
-impl BoundsCheck<&CompiledModuleMut> for StructHandle {
-    #[inline]
-    fn check_bounds(&self, module: &CompiledModuleMut) -> Vec<VMStatus> {
-        vec![
-            check_bounds_impl(&module.module_handles, self.module),
-            check_bounds_impl(&module.identifiers, self.name),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
-    }
-}
-
-impl BoundsCheck<&CompiledModuleMut> for FunctionHandle {
-    #[inline]
-    fn check_bounds(&self, module: &CompiledModuleMut) -> Vec<VMStatus> {
-        vec![
-            check_bounds_impl(&module.module_handles, self.module),
-            check_bounds_impl(&module.identifiers, self.name),
-            check_bounds_impl(&module.function_signatures, self.signature),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
-    }
-}
-
-impl BoundsCheck<&CompiledModuleMut> for StructDefinition {
-    #[inline]
-    fn check_bounds(&self, module: &CompiledModuleMut) -> Vec<VMStatus> {
-        vec![
-            check_bounds_impl(&module.struct_handles, self.struct_handle),
-            match &self.field_information {
-                StructFieldInformation::Native => None,
-                StructFieldInformation::Declared {
-                    field_count,
-                    fields,
-                } => module.check_field_range(*field_count, *fields),
-            },
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
-    }
-}
-
-impl BoundsCheck<&CompiledModuleMut> for FieldDefinition {
-    #[inline]
-    fn check_bounds(&self, module: &CompiledModuleMut) -> Vec<VMStatus> {
-        vec![
-            check_bounds_impl(&module.struct_handles, self.struct_),
-            check_bounds_impl(&module.identifiers, self.name),
-            check_bounds_impl(&module.type_signatures, self.signature),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
-    }
-}
-
-impl BoundsCheck<&CompiledModuleMut> for FunctionDefinition {
-    #[inline]
-    fn check_bounds(&self, module: &CompiledModuleMut) -> Vec<VMStatus> {
-        vec![
-            check_bounds_impl(&module.function_handles, self.function),
-            if self.is_native() {
-                None
-            } else {
-                check_bounds_impl(&module.locals_signatures, self.code.locals)
-            },
-        ]
-        .into_iter()
-        .flatten()
-        .chain(
-            self.acquires_global_resources
-                .iter()
-                .flat_map(|idx| check_bounds_impl(&module.struct_defs, *idx)),
+    fn check_struct_instantiation(
+        &self,
+        struct_instantiation: &StructDefInstantiation,
+    ) -> PartialVMResult<()> {
+        check_bounds_impl(&self.module.struct_defs, struct_instantiation.def)?;
+        check_bounds_impl(
+            &self.module.signatures,
+            struct_instantiation.type_parameters,
         )
-        .collect()
+    }
+
+    fn check_function_instantiation(
+        &self,
+        function_instantiation: &FunctionInstantiation,
+    ) -> PartialVMResult<()> {
+        check_bounds_impl(&self.module.function_handles, function_instantiation.handle)?;
+        check_bounds_impl(
+            &self.module.signatures,
+            function_instantiation.type_parameters,
+        )
+    }
+
+    fn check_field_instantiation(
+        &self,
+        field_instantiation: &FieldInstantiation,
+    ) -> PartialVMResult<()> {
+        check_bounds_impl(&self.module.field_handles, field_instantiation.handle)?;
+        check_bounds_impl(&self.module.signatures, field_instantiation.type_parameters)
+    }
+
+    fn check_signature(&self, signature: &Signature) -> PartialVMResult<()> {
+        for ty in &signature.0 {
+            self.check_type(ty)?
+        }
+        Ok(())
+    }
+
+    fn check_constant(&self, constant: &Constant) -> PartialVMResult<()> {
+        self.check_type(&constant.type_)
+    }
+
+    fn check_struct_def(&self, struct_def: &StructDefinition) -> PartialVMResult<()> {
+        check_bounds_impl(&self.module.struct_handles, struct_def.struct_handle)?;
+        // check signature (type) and type parameter for the field type
+        if let StructFieldInformation::Declared(fields) = &struct_def.field_information {
+            let type_param_count = self
+                .module
+                .struct_handles
+                .get(struct_def.struct_handle.into_index())
+                .map_or(0, |sh| sh.type_parameters.len());
+            // field signatures are inlined
+            for field in fields {
+                check_bounds_impl(&self.module.identifiers, field.name)?;
+                self.check_type(&field.signature.0)?;
+                self.check_type_parameter(&field.signature.0, type_param_count)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_function_def(
+        &mut self,
+        function_def_idx: usize,
+        function_def: &FunctionDefinition,
+    ) -> PartialVMResult<()> {
+        self.current_function = Some(FunctionDefinitionIndex(function_def_idx as TableIndex));
+        check_bounds_impl(&self.module.function_handles, function_def.function)?;
+        for ty in &function_def.acquires_global_resources {
+            check_bounds_impl(&self.module.struct_defs, *ty)?;
+        }
+        self.check_code(function_def_idx, function_def)
+    }
+
+    fn check_code(
+        &self,
+        function_def_idx: usize,
+        function_def: &FunctionDefinition,
+    ) -> PartialVMResult<()> {
+        let code_unit = match &function_def.code {
+            Some(code) => code,
+            None => return Ok(()),
+        };
+        check_bounds_impl(&self.module.signatures, code_unit.locals)?;
+
+        debug_assert!(function_def.function.into_index() < self.module.function_handles.len());
+        let function_handle = &self.module.function_handles[function_def.function.into_index()];
+        let type_param_count = function_handle.type_parameters.len();
+
+        debug_assert!(function_handle.parameters.into_index() < self.module.signatures.len());
+        let parameters = &self.module.signatures[function_handle.parameters.into_index()];
+
+        let locals = &self
+            .module
+            .signatures
+            .get(code_unit.locals.into_index())
+            .as_ref()
+            .unwrap()
+            .0;
+
+        // check if the number of parameters + locals is less than u8::MAX
+        let locals_count = locals.len() + parameters.len();
+
+        if locals_count > (u8::MAX as usize) + 1 {
+            return Err(verification_error(
+                StatusCode::TOO_MANY_LOCALS,
+                IndexKind::FunctionDefinition,
+                function_def_idx as TableIndex,
+            ));
+        }
+
+        // if there are locals check that the type parameters in local signature are in bounds.
+        for local in locals {
+            self.check_type_parameter(local, type_param_count)?
+        }
+
+        // check bytecodes
+        let code_len = code_unit.code.len();
+        for (bytecode_offset, bytecode) in code_unit.code.iter().enumerate() {
+            use self::Bytecode::*;
+
+            match bytecode {
+                LdConst(idx) => self.check_code_unit_bounds_impl(
+                    &self.module.constant_pool,
+                    *idx,
+                    bytecode_offset,
+                )?,
+                MutBorrowField(idx) | ImmBorrowField(idx) => self.check_code_unit_bounds_impl(
+                    &self.module.field_handles,
+                    *idx,
+                    bytecode_offset,
+                )?,
+                MutBorrowFieldGeneric(idx) | ImmBorrowFieldGeneric(idx) => {
+                    self.check_code_unit_bounds_impl(
+                        &self.module.field_instantiations,
+                        *idx,
+                        bytecode_offset,
+                    )?;
+                    // check type parameters in borrow are bound to the function type parameters
+                    if let Some(field_inst) = self.module.field_instantiations.get(idx.into_index())
+                    {
+                        if let Some(sig) = self
+                            .module
+                            .signatures
+                            .get(field_inst.type_parameters.into_index())
+                        {
+                            for ty in &sig.0 {
+                                self.check_type_parameter(ty, type_param_count)?
+                            }
+                        }
+                    }
+                }
+                Call(idx) => self.check_code_unit_bounds_impl(
+                    &self.module.function_handles,
+                    *idx,
+                    bytecode_offset,
+                )?,
+                CallGeneric(idx) => {
+                    self.check_code_unit_bounds_impl(
+                        &self.module.function_instantiations,
+                        *idx,
+                        bytecode_offset,
+                    )?;
+                    // check type parameters in call are bound to the function type parameters
+                    if let Some(func_inst) =
+                        self.module.function_instantiations.get(idx.into_index())
+                    {
+                        if let Some(sig) = self
+                            .module
+                            .signatures
+                            .get(func_inst.type_parameters.into_index())
+                        {
+                            for ty in &sig.0 {
+                                self.check_type_parameter(ty, type_param_count)?
+                            }
+                        }
+                    }
+                }
+                Pack(idx) | Unpack(idx) | Exists(idx) | ImmBorrowGlobal(idx)
+                | MutBorrowGlobal(idx) | MoveFrom(idx) | MoveTo(idx) => self
+                    .check_code_unit_bounds_impl(&self.module.struct_defs, *idx, bytecode_offset)?,
+                PackGeneric(idx)
+                | UnpackGeneric(idx)
+                | ExistsGeneric(idx)
+                | ImmBorrowGlobalGeneric(idx)
+                | MutBorrowGlobalGeneric(idx)
+                | MoveFromGeneric(idx)
+                | MoveToGeneric(idx) => {
+                    self.check_code_unit_bounds_impl(
+                        &self.module.struct_def_instantiations,
+                        *idx,
+                        bytecode_offset,
+                    )?;
+                    // check type parameters in type operations are bound to the function type parameters
+                    if let Some(struct_inst) =
+                        self.module.struct_def_instantiations.get(idx.into_index())
+                    {
+                        if let Some(sig) = self
+                            .module
+                            .signatures
+                            .get(struct_inst.type_parameters.into_index())
+                        {
+                            for ty in &sig.0 {
+                                self.check_type_parameter(ty, type_param_count)?
+                            }
+                        }
+                    }
+                }
+                // Instructions that refer to this code block.
+                BrTrue(offset) | BrFalse(offset) | Branch(offset) => {
+                    let offset = *offset as usize;
+                    if offset >= code_len {
+                        return Err(self.offset_out_of_bounds(
+                            StatusCode::INDEX_OUT_OF_BOUNDS,
+                            IndexKind::CodeDefinition,
+                            offset,
+                            code_len,
+                            bytecode_offset as CodeOffset,
+                        ));
+                    }
+                }
+                // Instructions that refer to the locals.
+                CopyLoc(idx) | MoveLoc(idx) | StLoc(idx) | MutBorrowLoc(idx)
+                | ImmBorrowLoc(idx) => {
+                    let idx = *idx as usize;
+                    if idx >= locals_count {
+                        return Err(self.offset_out_of_bounds(
+                            StatusCode::INDEX_OUT_OF_BOUNDS,
+                            IndexKind::LocalPool,
+                            idx,
+                            locals_count,
+                            bytecode_offset as CodeOffset,
+                        ));
+                    }
+                }
+
+                // List out the other options explicitly so there's a compile error if a new
+                // bytecode gets added.
+                FreezeRef | Pop | Ret | LdU8(_) | LdU64(_) | LdU128(_) | CastU8 | CastU64
+                | CastU128 | LdTrue | LdFalse | ReadRef | WriteRef | Add | Sub | Mul | Mod
+                | Div | BitOr | BitAnd | Xor | Shl | Shr | Or | And | Not | Eq | Neq | Lt | Gt
+                | Le | Ge | Abort | Nop => (),
+            }
+        }
+        Ok(())
+    }
+
+    fn check_type(&self, ty: &SignatureToken) -> PartialVMResult<()> {
+        use self::SignatureToken::*;
+
+        for ty in ty.preorder_traversal() {
+            match ty {
+                Bool | U8 | U64 | U128 | Address | Signer | TypeParameter(_) | Reference(_)
+                | MutableReference(_) | Vector(_) => (),
+                Struct(idx) => {
+                    check_bounds_impl(&self.module.struct_handles, *idx)?;
+                    if let Some(sh) = self.module.struct_handles.get(idx.into_index()) {
+                        if !sh.type_parameters.is_empty() {
+                            return Err(PartialVMError::new(
+                                StatusCode::NUMBER_OF_TYPE_ARGUMENTS_MISMATCH,
+                            )
+                            .with_message(format!(
+                                "expected {} type parameters got 0 (Struct)",
+                                sh.type_parameters.len(),
+                            )));
+                        }
+                    }
+                }
+                StructInstantiation(idx, type_params) => {
+                    check_bounds_impl(&self.module.struct_handles, *idx)?;
+                    if let Some(sh) = self.module.struct_handles.get(idx.into_index()) {
+                        if sh.type_parameters.len() != type_params.len() {
+                            return Err(PartialVMError::new(
+                                StatusCode::NUMBER_OF_TYPE_ARGUMENTS_MISMATCH,
+                            )
+                            .with_message(format!(
+                                "expected {} type parameters got {}",
+                                sh.type_parameters.len(),
+                                type_params.len(),
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_type_parameter(
+        &self,
+        ty: &SignatureToken,
+        type_param_count: usize,
+    ) -> PartialVMResult<()> {
+        use self::SignatureToken::*;
+
+        for ty in ty.preorder_traversal() {
+            match ty {
+                SignatureToken::TypeParameter(idx) => {
+                    if *idx as usize >= type_param_count {
+                        return Err(bounds_error(
+                            StatusCode::INDEX_OUT_OF_BOUNDS,
+                            IndexKind::TypeParameter,
+                            *idx,
+                            type_param_count,
+                        ));
+                    }
+                }
+
+                Bool
+                | U8
+                | U64
+                | U128
+                | Address
+                | Signer
+                | Struct(_)
+                | Reference(_)
+                | MutableReference(_)
+                | Vector(_)
+                | StructInstantiation(_, _) => (),
+            }
+        }
+        Ok(())
+    }
+
+    fn check_code_unit_bounds_impl<T, I>(
+        &self,
+        pool: &[T],
+        idx: I,
+        bytecode_offset: usize,
+    ) -> PartialVMResult<()>
+    where
+        I: ModuleIndex,
+    {
+        let idx = idx.into_index();
+        let len = pool.len();
+        if idx >= len {
+            Err(self.offset_out_of_bounds(
+                StatusCode::INDEX_OUT_OF_BOUNDS,
+                I::KIND,
+                idx,
+                len,
+                bytecode_offset as CodeOffset,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn offset_out_of_bounds(
+        &self,
+        status: StatusCode,
+        kind: IndexKind,
+        target_offset: usize,
+        target_pool_len: usize,
+        cur_bytecode_offset: CodeOffset,
+    ) -> PartialVMError {
+        match self.current_function {
+            None => {
+                let msg = format!("Indexing into bytecode {} during bounds checking but 'current_function' was not set", cur_bytecode_offset);
+                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR).with_message(msg)
+            }
+            Some(current_function_index) => offset_out_of_bounds_error(
+                status,
+                kind,
+                target_offset,
+                target_pool_len,
+                current_function_index,
+                cur_bytecode_offset,
+            ),
+        }
     }
 }
 
-impl<Context> BoundsCheck<Context> for TypeSignature
+fn check_bounds_impl<T, I>(pool: &[T], idx: I) -> PartialVMResult<()>
 where
-    Context: Copy,
-    SignatureToken: BoundsCheck<Context>,
+    I: ModuleIndex,
 {
-    #[inline]
-    fn check_bounds(&self, context: Context) -> Vec<VMStatus> {
-        self.0.check_bounds(context).into_iter().collect()
-    }
-}
-
-impl TypeSignature {
-    fn check_struct_handles(&self, struct_handles: &[StructHandle]) -> Vec<VMStatus> {
-        self.0.check_struct_handles(struct_handles)
-    }
-
-    fn check_type_parameters(&self, type_formals_len: usize) -> Vec<VMStatus> {
-        self.0.check_type_parameters(type_formals_len)
-    }
-}
-
-impl BoundsCheck<&CompiledModuleMut> for FunctionSignature {
-    #[inline]
-    fn check_bounds(&self, module: &CompiledModuleMut) -> Vec<VMStatus> {
-        self.return_types
-            .iter()
-            .map(|token| token.check_bounds((module, self)))
-            .chain(
-                self.arg_types
-                    .iter()
-                    .map(|token| token.check_bounds((module, self))),
-            )
-            .flatten()
-            .collect()
-    }
-}
-
-impl LocalsSignature {
-    fn check_type_parameters(&self, type_formals_len: usize) -> Vec<VMStatus> {
-        self.0
-            .iter()
-            .flat_map(|ty| ty.check_type_parameters(type_formals_len))
-            .collect()
-    }
-
-    fn check_struct_handles(&self, struct_handles: &[StructHandle]) -> Vec<VMStatus> {
-        self.0
-            .iter()
-            .flat_map(|ty| ty.check_struct_handles(struct_handles))
-            .collect()
-    }
-}
-
-impl BoundsCheck<(&[StructHandle], usize)> for SignatureToken {
-    fn check_bounds(&self, context: (&[StructHandle], usize)) -> Vec<VMStatus> {
-        self.check_type_parameters(context.1)
-            .into_iter()
-            .chain(self.check_struct_handles(context.0))
-            .collect()
-    }
-}
-
-impl SignatureToken {
-    pub fn check_type_parameters(&self, type_formals_len: usize) -> Vec<VMStatus> {
-        match self {
-            SignatureToken::Struct(_, type_actuals) => type_actuals
-                .iter()
-                .flat_map(|ty| ty.check_type_parameters(type_formals_len))
-                .collect(),
-            SignatureToken::Reference(ty) | SignatureToken::MutableReference(ty) => {
-                ty.check_type_parameters(type_formals_len)
-            }
-            SignatureToken::TypeParameter(idx) => {
-                let idx = *idx as usize;
-                if idx >= type_formals_len {
-                    vec![bounds_error(
-                        IndexKind::TypeParameter,
-                        idx,
-                        type_formals_len,
-                        StatusCode::INDEX_OUT_OF_BOUNDS,
-                    )]
-                } else {
-                    vec![]
-                }
-            }
-            _ => vec![],
-        }
-    }
-
-    pub fn check_struct_handles(&self, struct_handles: &[StructHandle]) -> Vec<VMStatus> {
-        match self {
-            SignatureToken::Struct(idx, type_actuals) => {
-                let mut errors: Vec<_> = type_actuals
-                    .iter()
-                    .flat_map(|ty| ty.check_struct_handles(struct_handles))
-                    .collect();
-                if let Some(err) = check_bounds_impl(struct_handles, *idx) {
-                    errors.push(err);
-                }
-                errors
-            }
-            SignatureToken::Reference(ty) | SignatureToken::MutableReference(ty) => {
-                ty.check_struct_handles(struct_handles)
-            }
-            _ => vec![],
-        }
-    }
-}
-
-impl BoundsCheck<(&[StructHandle], &[Kind])> for SignatureToken {
-    fn check_bounds(&self, context: (&[StructHandle], &[Kind])) -> Vec<VMStatus> {
-        self.check_bounds((context.0, context.1.len()))
-    }
-}
-
-impl BoundsCheck<(&CompiledModuleMut, &FunctionSignature)> for SignatureToken {
-    fn check_bounds(&self, context: (&CompiledModuleMut, &FunctionSignature)) -> Vec<VMStatus> {
-        self.check_bounds((
-            context.0.struct_handles.as_slice(),
-            context.1.type_formals.as_slice(),
+    let idx = idx.into_index();
+    let len = pool.len();
+    if idx >= len {
+        Err(bounds_error(
+            StatusCode::INDEX_OUT_OF_BOUNDS,
+            I::KIND,
+            idx as TableIndex,
+            len,
         ))
-    }
-}
-
-impl BoundsCheck<(&CompiledModuleMut, &StructHandle)> for SignatureToken {
-    fn check_bounds(&self, context: (&CompiledModuleMut, &StructHandle)) -> Vec<VMStatus> {
-        self.check_bounds((
-            context.0.struct_handles.as_slice(),
-            context.1.type_formals.as_slice(),
-        ))
-    }
-}
-
-fn check_type_actuals_bounds(
-    context: (&CompiledModuleMut, &FunctionSignature),
-    bytecode_offset: usize,
-    idx: LocalsSignatureIndex,
-) -> Vec<VMStatus> {
-    let (module, function_sig) = context;
-    let errs = check_code_unit_bounds_impl(&module.locals_signatures, bytecode_offset, idx);
-    if !errs.is_empty() {
-        return errs;
-    }
-    module.locals_signatures[idx.0 as usize].check_type_parameters(function_sig.type_formals.len())
-}
-
-impl BoundsCheck<(&CompiledModuleMut, &FunctionSignature)> for CodeUnit {
-    fn check_bounds(&self, context: (&CompiledModuleMut, &FunctionSignature)) -> Vec<VMStatus> {
-        let (module, _) = context;
-
-        let locals = &module.locals_signatures[self.locals.0 as usize];
-        let locals_len = locals.0.len();
-
-        let code = &self.code;
-        let code_len = code.len();
-
-        code.iter()
-            .enumerate()
-            .flat_map(|(bytecode_offset, bytecode)| {
-                use self::Bytecode::*;
-
-                match bytecode {
-                    // Instructions that refer to other pools.
-                    LdAddr(idx) => {
-                        check_code_unit_bounds_impl(&module.address_pool, bytecode_offset, *idx)
-                    }
-                    LdByteArray(idx) => {
-                        check_code_unit_bounds_impl(&module.byte_array_pool, bytecode_offset, *idx)
-                    }
-                    LdStr(idx) => {
-                        check_code_unit_bounds_impl(&module.user_strings, bytecode_offset, *idx)
-                    }
-                    MutBorrowField(idx) | ImmBorrowField(idx) => {
-                        check_code_unit_bounds_impl(&module.field_defs, bytecode_offset, *idx)
-                    }
-                    Call(idx, type_actuals_idx) => {
-                        check_code_unit_bounds_impl(&module.function_handles, bytecode_offset, *idx)
-                            .into_iter()
-                            .chain(check_type_actuals_bounds(
-                                context,
-                                bytecode_offset,
-                                *type_actuals_idx,
-                            ))
-                            .collect()
-                    }
-                    Pack(idx, type_actuals_idx)
-                    | Unpack(idx, type_actuals_idx)
-                    | Exists(idx, type_actuals_idx)
-                    | ImmBorrowGlobal(idx, type_actuals_idx)
-                    | MutBorrowGlobal(idx, type_actuals_idx)
-                    | MoveFrom(idx, type_actuals_idx)
-                    | MoveToSender(idx, type_actuals_idx) => {
-                        check_code_unit_bounds_impl(&module.struct_defs, bytecode_offset, *idx)
-                            .into_iter()
-                            .chain(check_type_actuals_bounds(
-                                context,
-                                bytecode_offset,
-                                *type_actuals_idx,
-                            ))
-                            .collect()
-                    }
-                    // Instructions that refer to this code block.
-                    BrTrue(offset) | BrFalse(offset) | Branch(offset) => {
-                        let offset = *offset as usize;
-                        if offset >= code_len {
-                            let status = bytecode_offset_err(
-                                IndexKind::CodeDefinition,
-                                offset,
-                                code_len,
-                                bytecode_offset,
-                                StatusCode::INDEX_OUT_OF_BOUNDS,
-                            );
-                            vec![status]
-                        } else {
-                            vec![]
-                        }
-                    }
-                    // Instructions that refer to the locals.
-                    CopyLoc(idx) | MoveLoc(idx) | StLoc(idx) | MutBorrowLoc(idx)
-                    | ImmBorrowLoc(idx) => {
-                        let idx = *idx as usize;
-                        if idx >= locals_len {
-                            let status = bytecode_offset_err(
-                                IndexKind::LocalPool,
-                                idx,
-                                locals_len,
-                                bytecode_offset,
-                                StatusCode::INDEX_OUT_OF_BOUNDS,
-                            );
-                            vec![status]
-                        } else {
-                            vec![]
-                        }
-                    }
-
-                    // List out the other options explicitly so there's a compile error if a new
-                    // bytecode gets added.
-                    FreezeRef | Pop | Ret | LdConst(_) | LdTrue | LdFalse | ReadRef | WriteRef
-                    | Add | Sub | Mul | Mod | Div | BitOr | BitAnd | Xor | Or | And | Not | Eq
-                    | Neq | Lt | Gt | Le | Ge | Abort | GetTxnGasUnitPrice | GetTxnMaxGasUnits
-                    | GetGasRemaining | GetTxnSenderAddress | CreateAccount
-                    | GetTxnSequenceNumber | GetTxnPublicKey => vec![],
-                }
-            })
-            .collect()
+    } else {
+        Ok(())
     }
 }

@@ -1,33 +1,27 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use bytecode_verifier::{
-    verifier::{verify_module_dependencies, VerifiedProgram},
-    VerifiedModule,
-};
+#![forbid(unsafe_code)]
+
+use anyhow::Context;
+use bytecode_verifier::{verify_module, verify_script, DependencyChecker};
+use compiled_stdlib::{stdlib_modules, StdLibOptions};
 use compiler::{util, Compiler};
 use ir_to_bytecode::parser::{parse_module, parse_script};
-use libra_types::{
-    access_path::AccessPath,
-    account_address::AccountAddress,
-    transaction::{Module, Script},
-    vm_error::VMStatus,
-};
-use serde_json;
+use libra_types::{access_path::AccessPath, account_address::AccountAddress, account_config};
 use std::{
     convert::TryFrom,
     fs,
     io::Write,
     path::{Path, PathBuf},
 };
-use stdlib::stdlib_modules;
 use structopt::StructOpt;
-use vm::file_format::CompiledModule;
+use vm::{errors::VMError, file_format::CompiledModule};
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "IR Compiler", about = "Move IR to bytecode compiler.")]
 struct Args {
-    /// Treat input file as a module (default is to treat file as a program)
+    /// Treat input file as a module (default is to treat file as a script)
     #[structopt(short = "m", long = "module")]
     pub module_input: bool,
     /// Account address used for publishing
@@ -53,29 +47,27 @@ struct Args {
     pub output_source_maps: bool,
 }
 
-fn print_errors_and_exit(verification_errors: &[VMStatus]) -> ! {
-    println!("Verification failed. Errors below:");
-    for e in verification_errors {
-        println!("{:?}", e);
-    }
+fn print_error_and_exit(verification_error: &VMError) -> ! {
+    println!("Verification failed:");
+    println!("{:?}", verification_error);
     std::process::exit(1);
 }
 
-fn do_verify_module(module: CompiledModule, dependencies: &[VerifiedModule]) -> VerifiedModule {
-    let verified_module =
-        VerifiedModule::new(module).unwrap_or_else(|(_, errors)| print_errors_and_exit(&errors));
-    let errors = verify_module_dependencies(&verified_module, dependencies);
-    if !errors.is_empty() {
-        print_errors_and_exit(&errors);
+fn do_verify_module(module: CompiledModule, dependencies: &[CompiledModule]) -> CompiledModule {
+    verify_module(&module).unwrap_or_else(|err| print_error_and_exit(&err));
+    if let Err(err) = DependencyChecker::verify_module(&module, dependencies) {
+        print_error_and_exit(&err);
     }
-    verified_module
+    module
 }
 
 fn write_output(path: &PathBuf, buf: &[u8]) {
     let mut f = fs::File::create(path)
-        .unwrap_or_else(|err| panic!("Unable to open output file {:?}: {}", path, err));
+        .with_context(|| format!("Unable to open output file {:?}", path))
+        .unwrap();
     f.write_all(&buf)
-        .unwrap_or_else(|err| panic!("Unable to write to output file {:?}: {}", path, err));
+        .with_context(|| format!("Unable to write to output file {:?}", path))
+        .unwrap();
 }
 
 fn main() {
@@ -84,7 +76,7 @@ fn main() {
     let address = args
         .address
         .map(|a| AccountAddress::try_from(a).unwrap())
-        .unwrap_or_else(AccountAddress::default);
+        .unwrap_or(account_config::CORE_CODE_ADDRESS);
     let source_path = Path::new(&args.source_path);
     let mvir_extension = "mvir";
     let mv_extension = "mv";
@@ -100,13 +92,15 @@ fn main() {
         std::process::exit(1);
     }
 
+    let file_name = args.source_path.as_path().as_os_str().to_str().unwrap();
+
     if args.list_dependencies {
         let source = fs::read_to_string(args.source_path.clone()).expect("Unable to read file");
         let dependency_list: Vec<AccessPath> = if args.module_input {
-            let module = parse_module(&source).expect("Unable to parse module");
+            let module = parse_module(file_name, &source).expect("Unable to parse module");
             module.get_external_deps()
         } else {
-            let script = parse_script(&source).expect("Unable to parse module");
+            let script = parse_script(file_name, &source).expect("Unable to parse module");
             script.get_external_deps()
         }
         .into_iter()
@@ -127,17 +121,16 @@ fn main() {
             deps_list
                 .into_iter()
                 .map(|module_bytes| {
-                    VerifiedModule::new(
-                        CompiledModule::deserialize(module_bytes.as_slice())
-                            .expect("Downloaded module blob can't be deserialized"),
-                    )
-                    .expect("Downloaded module blob failed verifier")
+                    let module = CompiledModule::deserialize(module_bytes.as_slice())
+                        .expect("Downloaded module blob can't be deserialized");
+                    verify_module(&module).expect("Downloaded module blob failed verifier");
+                    module
                 })
                 .collect()
         } else if args.no_stdlib {
             vec![]
         } else {
-            stdlib_modules().to_vec()
+            stdlib_modules(StdLibOptions::Compiled).to_vec()
         }
     };
 
@@ -149,21 +142,15 @@ fn main() {
             extra_deps: deps,
             ..Compiler::default()
         };
-        let (compiled_program, source_map, dependencies) = compiler
-            .into_compiled_program_and_source_maps_deps(&source)
-            .expect("Failed to compile program");
+        let (compiled_script, source_map) = compiler
+            .into_compiled_script_and_source_map(file_name, &source)
+            .expect("Failed to compile script");
 
-        let compiled_program = if !args.no_verify {
-            let verified_program = VerifiedProgram::new(compiled_program, &dependencies)
-                .expect("Failed to verify program");
-            verified_program.into_inner()
-        } else {
-            compiled_program
-        };
+        verify_script(&compiled_script).expect("Failed to verify script");
 
         if args.output_source_maps {
-            let source_map_bytes = serde_json::to_vec(&source_map)
-                .expect("Unable to serialize source maps for program");
+            let source_map_bytes =
+                lcs::to_bytes(&source_map).expect("Unable to serialize source maps for script");
             write_output(
                 &source_path.with_extension(source_map_extension),
                 &source_map_bytes,
@@ -171,26 +158,22 @@ fn main() {
         }
 
         let mut script = vec![];
-        compiled_program
-            .script
+        compiled_script
             .serialize(&mut script)
             .expect("Unable to serialize script");
-        let payload = Script::new(script, vec![]);
-        let payload_bytes = serde_json::to_vec(&payload).expect("Unable to serialize program");
-        write_output(&source_path.with_extension(mv_extension), &payload_bytes);
+        write_output(&source_path.with_extension(mv_extension), &script);
     } else {
         let (compiled_module, source_map) =
             util::do_compile_module(&args.source_path, address, &deps);
         let compiled_module = if !args.no_verify {
-            let verified_module = do_verify_module(compiled_module, &deps);
-            verified_module.into_inner()
+            do_verify_module(compiled_module, &deps)
         } else {
             compiled_module
         };
 
         if args.output_source_maps {
-            let source_map_bytes = serde_json::to_vec(&source_map)
-                .expect("Unable to serialize source maps for program");
+            let source_map_bytes =
+                lcs::to_bytes(&source_map).expect("Unable to serialize source maps for module");
             write_output(
                 &source_path.with_extension(source_map_extension),
                 &source_map_bytes,
@@ -201,8 +184,6 @@ fn main() {
         compiled_module
             .serialize(&mut module)
             .expect("Unable to serialize module");
-        let payload = Module::new(module);
-        let payload_bytes = serde_json::to_vec(&payload).expect("Unable to serialize program");
-        write_output(&source_path.with_extension(mv_extension), &payload_bytes);
+        write_output(&source_path.with_extension(mv_extension), &module);
     }
 }

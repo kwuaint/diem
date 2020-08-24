@@ -1,6 +1,9 @@
+// Copyright (c) The Libra Core Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use crate::{ledger_counters::LedgerCounter, LibraDB};
-use libra_tools::tempdir::TempPath;
+use libra_temppath::TempPath;
 
 fn bump_ledger_counters(
     store: &SystemStore,
@@ -20,7 +23,7 @@ fn bump_ledger_counters(
 #[test]
 fn test_inc_ledger_counters() {
     let tmp_dir = TempPath::new();
-    let db = LibraDB::new(&tmp_dir);
+    let db = LibraDB::new_for_test(&tmp_dir);
     let store = &db.system_store;
 
     // First batch, add to zeros.

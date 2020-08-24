@@ -1,74 +1,59 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{block::Block, common::Round, quorum_cert::QuorumCert};
-use executor::{ExecutedTrees, ProcessedVMOutput, StateComputeResult};
-use libra_crypto::hash::HashValue;
-use std::{
-    fmt::{Display, Formatter},
-    sync::Arc,
+use crate::{
+    block::Block,
+    common::{Payload, Round},
+    quorum_cert::QuorumCert,
+    vote_proposal::{MaybeSignedVoteProposal, VoteProposal},
 };
+use executor_types::StateComputeResult;
+use libra_crypto::hash::HashValue;
+use libra_types::block_info::BlockInfo;
+use std::fmt::{Debug, Display, Formatter};
 
 /// ExecutedBlocks are managed in a speculative tree, the committed blocks form a chain. Besides
 /// block data, each executed block also has other derived meta data which could be regenerated from
 /// blocks.
-#[derive(Clone, Debug)]
-pub struct ExecutedBlock<T> {
+#[derive(Clone, Eq, PartialEq)]
+pub struct ExecutedBlock {
     /// Block data that cannot be regenerated.
-    block: Block<T>,
-    /// The execution output is calculated for all the pending blocks prior to insertion to
+    block: Block,
+    /// The state_compute_result is calculated for all the pending blocks prior to insertion to
     /// the tree. The execution results are not persisted: they're recalculated again for the
     /// pending blocks upon restart.
-    output: Arc<ProcessedVMOutput>,
+    state_compute_result: StateComputeResult,
 }
 
-impl<T: PartialEq> PartialEq for ExecutedBlock<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.block == other.block && self.compute_result() == other.compute_result()
-    }
-}
-
-impl<T: Eq> Eq for ExecutedBlock<T> where T: PartialEq {}
-
-impl<T: PartialEq> Display for ExecutedBlock<T> {
+impl Debug for ExecutedBlock {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        self.block().fmt(f)
+        write!(f, "{}", self)
     }
 }
 
-impl<T> ExecutedBlock<T> {
-    pub fn new(block: Block<T>, output: ProcessedVMOutput) -> Self {
+impl Display for ExecutedBlock {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.block())
+    }
+}
+
+impl ExecutedBlock {
+    pub fn new(block: Block, state_compute_result: StateComputeResult) -> Self {
         Self {
             block,
-            output: Arc::new(output),
+            state_compute_result,
         }
     }
 
-    pub fn block(&self) -> &Block<T> {
+    pub fn block(&self) -> &Block {
         &self.block
-    }
-
-    pub fn compute_result(&self) -> StateComputeResult {
-        self.output().state_compute_result()
-    }
-
-    pub fn epoch(&self) -> u64 {
-        self.block().epoch()
-    }
-
-    pub fn executed_trees(&self) -> &ExecutedTrees {
-        self.output.executed_trees()
     }
 
     pub fn id(&self) -> HashValue {
         self.block().id()
     }
 
-    pub fn output(&self) -> &Arc<ProcessedVMOutput> {
-        &self.output
-    }
-
-    pub fn payload(&self) -> Option<&T> {
+    pub fn payload(&self) -> Option<&Payload> {
         self.block().payload()
     }
 
@@ -87,13 +72,27 @@ impl<T> ExecutedBlock<T> {
     pub fn timestamp_usecs(&self) -> u64 {
         self.block().timestamp_usecs()
     }
-}
 
-impl<T> ExecutedBlock<T>
-where
-    T: PartialEq,
-{
-    pub fn is_nil_block(&self) -> bool {
-        self.block().is_nil_block()
+    pub fn compute_result(&self) -> &StateComputeResult {
+        &self.state_compute_result
+    }
+
+    pub fn block_info(&self) -> BlockInfo {
+        self.block().gen_block_info(
+            self.compute_result().root_hash(),
+            self.compute_result().version(),
+            self.compute_result().epoch_state().clone(),
+        )
+    }
+
+    pub fn maybe_signed_vote_proposal(&self) -> MaybeSignedVoteProposal {
+        MaybeSignedVoteProposal {
+            vote_proposal: VoteProposal::new(
+                self.compute_result().extension_proof(),
+                self.block.clone(),
+                self.compute_result().epoch_state().clone(),
+            ),
+            signature: self.compute_result().signature().clone(),
+        }
     }
 }

@@ -1,18 +1,14 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
 #![recursion_limit = "128"]
-
-#[macro_use]
-extern crate prometheus;
 
 pub mod counters;
 mod json_encoder;
+mod json_metrics;
 pub mod metric_server;
 mod public_metrics;
-
-mod service_metrics;
-pub use service_metrics::ServiceMetrics;
 
 mod op_counters;
 pub use op_counters::{DurationHistogram, OpMetrics};
@@ -21,19 +17,18 @@ pub use op_counters::{DurationHistogram, OpMetrics};
 mod unit_tests;
 
 // Re-export counter types from prometheus crate
-pub use prometheus::{Histogram, IntCounter, IntCounterVec, IntGauge, IntGaugeVec};
-
-use failure::Result;
-use libra_logger::prelude::*;
-use prometheus::{
-    core::{Collector, Metric},
-    proto::MetricType,
-    Encoder, TextEncoder,
+pub use prometheus::{
+    register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec,
+    register_int_gauge, register_int_gauge_vec, Histogram, HistogramVec, IntCounter, IntCounterVec,
+    IntGauge, IntGaugeVec,
 };
+
+use anyhow::Result;
+use libra_logger::prelude::*;
+use prometheus::{proto::MetricType, Encoder, TextEncoder};
 use std::{
     collections::HashMap,
     fs::{create_dir_all, File, OpenOptions},
-    hash::BuildHasher,
     io::Write,
     path::Path,
     thread, time,
@@ -123,21 +118,18 @@ pub fn dump_all_metrics_to_file_periodically<P: AsRef<Path>>(
     });
 }
 
-pub fn export_counter<M, S>(col: &mut HashMap<String, String, S>, counter: &M)
-where
-    M: Metric,
-    S: BuildHasher,
-{
-    let c = counter.metric();
-    col.insert(
-        c.get_label()[0].get_name().to_string(),
-        c.get_counter().get_value().to_string(),
-    );
-}
-
-pub fn get_metric_name<M>(metric: &M) -> String
-where
-    M: Collector,
-{
-    metric.collect()[0].get_name().to_string()
+/// Helper function to record metrics for external calls.
+/// Include call counts, time, and whether it's inside or not (1 or 0).
+/// It assumes a OpMetrics defined as OP_COUNTERS in crate::counters;
+#[macro_export]
+macro_rules! monitor {
+    ( $name:literal, $fn:expr ) => {{
+        use crate::counters::OP_COUNTERS;
+        let _timer = OP_COUNTERS.timer($name);
+        let gauge = OP_COUNTERS.gauge(concat!($name, "_running"));
+        gauge.inc();
+        let result = $fn;
+        gauge.dec();
+        result
+    }};
 }

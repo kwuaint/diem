@@ -2,15 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use libra_proptest_helpers::pick_slice_idxs;
-use libra_types::vm_error::{StatusCode, VMStatus};
+use libra_types::vm_status::StatusCode;
 use proptest::{prelude::*, sample::Index as PropIndex};
 use std::collections::BTreeMap;
 use vm::{
-    errors::{append_err_info, bytecode_offset_err},
+    errors::{offset_out_of_bounds, PartialVMError},
     file_format::{
-        AddressPoolIndex, ByteArrayPoolIndex, Bytecode, CodeOffset, CompiledModuleMut,
-        FieldDefinitionIndex, FunctionHandleIndex, LocalIndex, StructDefinitionIndex, TableIndex,
-        UserStringIndex, NO_TYPE_ACTUALS,
+        Bytecode, CodeOffset, CompiledModuleMut, ConstantPoolIndex, FieldHandleIndex,
+        FieldInstantiationIndex, FunctionDefinitionIndex, FunctionHandleIndex,
+        FunctionInstantiationIndex, LocalIndex, StructDefInstantiationIndex, StructDefinitionIndex,
+        TableIndex,
     },
     internals::ModuleIndex,
     IndexKind,
@@ -50,69 +51,72 @@ pub struct ApplyCodeUnitBoundsContext<'a> {
 }
 
 macro_rules! new_bytecode {
-    ($dst_len: expr, $bytecode_idx: expr, $offset: expr, $idx_type: ident, $bytecode_ident: tt) => {{
-        let dst_len = $dst_len;
-        let new_idx = (dst_len + $offset) as TableIndex;
+    ($dst_len:expr, $fidx:expr, $bcidx:expr, $offset:expr, $kind:ident, $bytecode_ident:tt) => {{
+        let dst_len: usize = $dst_len;
+        let new_idx: usize = dst_len + $offset;
         (
-            $bytecode_ident($idx_type::new(new_idx)),
-            bytecode_offset_err(
-                $idx_type::KIND,
-                new_idx as usize,
-                dst_len,
-                $bytecode_idx,
+            $bytecode_ident($kind::new(new_idx as TableIndex)),
+            offset_out_of_bounds(
                 StatusCode::INDEX_OUT_OF_BOUNDS,
+                $kind::KIND,
+                new_idx,
+                dst_len,
+                $fidx,
+                $bcidx as CodeOffset,
             ),
         )
     }};
 }
 
 macro_rules! struct_bytecode {
-    ($dst_len: expr, $bytecode_idx: expr, $offset: expr, $idx_type: ident, $bytecode_ident: tt) => {{
+    ($dst_len: expr, $fidx:expr, $bcidx: expr, $offset: expr, $idx_type: ident, $bytecode_ident: tt) => {{
         let dst_len = $dst_len;
-        let new_idx = (dst_len + $offset) as TableIndex;
+        let new_idx = dst_len + $offset;
         (
-            // TODO: check this again once generics is implemented
-            $bytecode_ident($idx_type::new(new_idx), NO_TYPE_ACTUALS),
-            bytecode_offset_err(
-                $idx_type::KIND,
-                new_idx as usize,
-                dst_len,
-                $bytecode_idx,
+            $bytecode_ident($idx_type::new(new_idx as TableIndex)),
+            offset_out_of_bounds(
                 StatusCode::INDEX_OUT_OF_BOUNDS,
+                $idx_type::KIND,
+                new_idx,
+                dst_len,
+                $fidx,
+                $bcidx as CodeOffset,
             ),
         )
     }};
 }
 
 macro_rules! code_bytecode {
-    ($code_len: expr, $bytecode_idx: expr, $offset: expr, $bytecode_ident: tt) => {{
+    ($code_len: expr, $fidx:expr, $bcidx: expr, $offset: expr, $bytecode_ident: tt) => {{
         let code_len = $code_len;
         let new_idx = code_len + $offset;
         (
             $bytecode_ident(new_idx as CodeOffset),
-            bytecode_offset_err(
+            offset_out_of_bounds(
+                StatusCode::INDEX_OUT_OF_BOUNDS,
                 IndexKind::CodeDefinition,
                 new_idx,
                 code_len,
-                $bytecode_idx,
-                StatusCode::INDEX_OUT_OF_BOUNDS,
+                $fidx,
+                $bcidx as CodeOffset,
             ),
         )
     }};
 }
 
 macro_rules! locals_bytecode {
-    ($locals_len: expr, $bytecode_idx: expr, $offset: expr, $bytecode_ident: tt) => {{
+    ($locals_len: expr, $fidx:expr, $bcidx: expr, $offset: expr, $bytecode_ident: tt) => {{
         let locals_len = $locals_len;
         let new_idx = locals_len + $offset;
         (
             $bytecode_ident(new_idx as LocalIndex),
-            bytecode_offset_err(
+            offset_out_of_bounds(
+                StatusCode::INDEX_OUT_OF_BOUNDS,
                 IndexKind::LocalPool,
                 new_idx,
                 locals_len,
-                $bytecode_idx,
-                StatusCode::INDEX_OUT_OF_BOUNDS,
+                $fidx,
+                $bcidx as CodeOffset,
             ),
         )
     }};
@@ -126,7 +130,7 @@ impl<'a> ApplyCodeUnitBoundsContext<'a> {
         }
     }
 
-    pub fn apply(mut self) -> Vec<VMStatus> {
+    pub fn apply(mut self) -> Vec<PartialVMError> {
         let function_def_len = self.module.function_defs.len();
 
         let mut mutation_map = BTreeMap::new();
@@ -138,7 +142,7 @@ impl<'a> ApplyCodeUnitBoundsContext<'a> {
             let picked_idx = mutation.function_def.index(function_def_len);
             mutation_map
                 .entry(picked_idx)
-                .or_insert_with(|| vec![])
+                .or_insert_with(Vec::new)
                 .push(mutation);
         }
 
@@ -150,29 +154,34 @@ impl<'a> ApplyCodeUnitBoundsContext<'a> {
         results
     }
 
-    fn apply_one(&mut self, idx: usize, mutations: Vec<CodeUnitBoundsMutation>) -> Vec<VMStatus> {
+    fn apply_one(
+        &mut self,
+        fidx: usize,
+        mutations: Vec<CodeUnitBoundsMutation>,
+    ) -> Vec<PartialVMError> {
         // For this function def, find all the places where a bounds mutation can be applied.
-        let (code_len, locals_len) = {
-            let code = &mut self.module.function_defs[idx].code;
-            (
-                code.code.len(),
-                self.module.locals_signatures[code.locals.into_index()].len(),
-            )
-        };
+        let func_def = &mut self.module.function_defs[fidx];
+        let current_fdef = FunctionDefinitionIndex(fidx as TableIndex);
+        let func_handle = &self.module.function_handles[func_def.function.into_index()];
+        let code = func_def.code.as_mut().unwrap();
+        let locals_len = self.module.signatures[func_handle.parameters.into_index()].len()
+            + self.module.signatures[code.locals.into_index()].len();
+        let code = &mut code.code;
+        let code_len = code.len();
 
-        let code = &mut self.module.function_defs[idx].code.code;
         let interesting_offsets: Vec<usize> = (0..code.len())
             .filter(|bytecode_idx| is_interesting(&code[*bytecode_idx]))
             .collect();
         let to_mutate = pick_slice_idxs(interesting_offsets.len(), &mutations);
 
         // These have to be computed upfront because self.module is being mutated below.
-        let address_pool_len = self.module.address_pool.len();
-        let user_strings_len = self.module.user_strings.len();
-        let byte_array_pool_len = self.module.byte_array_pool.len();
+        let constant_pool_len = self.module.constant_pool.len();
         let function_handles_len = self.module.function_handles.len();
-        let field_defs_len = self.module.field_defs.len();
+        let field_handle_len = self.module.field_handles.len();
         let struct_defs_len = self.module.struct_defs.len();
+        let struct_inst_len = self.module.struct_def_instantiations.len();
+        let function_inst_len = self.module.function_instantiations.len();
+        let field_inst_len = self.module.field_instantiations.len();
 
         mutations
             .iter()
@@ -183,124 +192,220 @@ impl<'a> ApplyCodeUnitBoundsContext<'a> {
                 use Bytecode::*;
 
                 let (new_bytecode, err) = match code[bytecode_idx] {
-                    LdAddr(_) => new_bytecode!(
-                        address_pool_len,
+                    LdConst(_) => new_bytecode!(
+                        constant_pool_len,
+                        current_fdef,
                         bytecode_idx,
                         offset,
-                        AddressPoolIndex,
-                        LdAddr
-                    ),
-                    LdStr(_) => new_bytecode!(
-                        user_strings_len,
-                        bytecode_idx,
-                        offset,
-                        UserStringIndex,
-                        LdStr
-                    ),
-                    LdByteArray(_) => new_bytecode!(
-                        byte_array_pool_len,
-                        bytecode_idx,
-                        offset,
-                        ByteArrayPoolIndex,
-                        LdByteArray
+                        ConstantPoolIndex,
+                        LdConst
                     ),
                     ImmBorrowField(_) => new_bytecode!(
-                        field_defs_len,
+                        field_handle_len,
+                        current_fdef,
                         bytecode_idx,
                         offset,
-                        FieldDefinitionIndex,
+                        FieldHandleIndex,
                         ImmBorrowField
                     ),
-                    MutBorrowField(_) => new_bytecode!(
-                        field_defs_len,
+                    ImmBorrowFieldGeneric(_) => new_bytecode!(
+                        field_inst_len,
+                        current_fdef,
                         bytecode_idx,
                         offset,
-                        FieldDefinitionIndex,
+                        FieldInstantiationIndex,
+                        ImmBorrowFieldGeneric
+                    ),
+                    MutBorrowField(_) => new_bytecode!(
+                        field_handle_len,
+                        current_fdef,
+                        bytecode_idx,
+                        offset,
+                        FieldHandleIndex,
                         MutBorrowField
                     ),
-                    Call(_, _) => struct_bytecode!(
+                    MutBorrowFieldGeneric(_) => new_bytecode!(
+                        field_inst_len,
+                        current_fdef,
+                        bytecode_idx,
+                        offset,
+                        FieldInstantiationIndex,
+                        MutBorrowFieldGeneric
+                    ),
+                    Call(_) => struct_bytecode!(
                         function_handles_len,
+                        current_fdef,
                         bytecode_idx,
                         offset,
                         FunctionHandleIndex,
                         Call
                     ),
-                    Pack(_, _) => struct_bytecode!(
+                    CallGeneric(_) => struct_bytecode!(
+                        function_inst_len,
+                        current_fdef,
+                        bytecode_idx,
+                        offset,
+                        FunctionInstantiationIndex,
+                        CallGeneric
+                    ),
+                    Pack(_) => struct_bytecode!(
                         struct_defs_len,
+                        current_fdef,
                         bytecode_idx,
                         offset,
                         StructDefinitionIndex,
                         Pack
                     ),
-                    Unpack(_, _) => struct_bytecode!(
+                    PackGeneric(_) => struct_bytecode!(
+                        struct_inst_len,
+                        current_fdef,
+                        bytecode_idx,
+                        offset,
+                        StructDefInstantiationIndex,
+                        PackGeneric
+                    ),
+                    Unpack(_) => struct_bytecode!(
                         struct_defs_len,
+                        current_fdef,
                         bytecode_idx,
                         offset,
                         StructDefinitionIndex,
                         Unpack
                     ),
-                    Exists(_, _) => struct_bytecode!(
+                    UnpackGeneric(_) => struct_bytecode!(
+                        struct_inst_len,
+                        current_fdef,
+                        bytecode_idx,
+                        offset,
+                        StructDefInstantiationIndex,
+                        UnpackGeneric
+                    ),
+                    Exists(_) => struct_bytecode!(
                         struct_defs_len,
+                        current_fdef,
                         bytecode_idx,
                         offset,
                         StructDefinitionIndex,
                         Exists
                     ),
-                    MutBorrowGlobal(_, _) => struct_bytecode!(
+                    ExistsGeneric(_) => struct_bytecode!(
+                        struct_inst_len,
+                        current_fdef,
+                        bytecode_idx,
+                        offset,
+                        StructDefInstantiationIndex,
+                        ExistsGeneric
+                    ),
+                    MutBorrowGlobal(_) => struct_bytecode!(
                         struct_defs_len,
+                        current_fdef,
                         bytecode_idx,
                         offset,
                         StructDefinitionIndex,
                         MutBorrowGlobal
                     ),
-                    ImmBorrowGlobal(_, _) => struct_bytecode!(
+                    MutBorrowGlobalGeneric(_) => struct_bytecode!(
+                        struct_inst_len,
+                        current_fdef,
+                        bytecode_idx,
+                        offset,
+                        StructDefInstantiationIndex,
+                        MutBorrowGlobalGeneric
+                    ),
+                    ImmBorrowGlobal(_) => struct_bytecode!(
                         struct_defs_len,
+                        current_fdef,
                         bytecode_idx,
                         offset,
                         StructDefinitionIndex,
                         ImmBorrowGlobal
                     ),
-                    MoveFrom(_, _) => struct_bytecode!(
+                    ImmBorrowGlobalGeneric(_) => struct_bytecode!(
+                        struct_inst_len,
+                        current_fdef,
+                        bytecode_idx,
+                        offset,
+                        StructDefInstantiationIndex,
+                        ImmBorrowGlobalGeneric
+                    ),
+                    MoveFrom(_) => struct_bytecode!(
                         struct_defs_len,
+                        current_fdef,
                         bytecode_idx,
                         offset,
                         StructDefinitionIndex,
                         MoveFrom
                     ),
-                    MoveToSender(_, _) => struct_bytecode!(
+                    MoveFromGeneric(_) => struct_bytecode!(
+                        struct_inst_len,
+                        current_fdef,
+                        bytecode_idx,
+                        offset,
+                        StructDefInstantiationIndex,
+                        MoveFromGeneric
+                    ),
+                    MoveTo(_) => struct_bytecode!(
                         struct_defs_len,
+                        current_fdef,
                         bytecode_idx,
                         offset,
                         StructDefinitionIndex,
-                        MoveToSender
+                        MoveTo
                     ),
-                    BrTrue(_) => code_bytecode!(code_len, bytecode_idx, offset, BrTrue),
-                    BrFalse(_) => code_bytecode!(code_len, bytecode_idx, offset, BrFalse),
-                    Branch(_) => code_bytecode!(code_len, bytecode_idx, offset, Branch),
-                    CopyLoc(_) => locals_bytecode!(locals_len, bytecode_idx, offset, CopyLoc),
-                    MoveLoc(_) => locals_bytecode!(locals_len, bytecode_idx, offset, MoveLoc),
-                    StLoc(_) => locals_bytecode!(locals_len, bytecode_idx, offset, StLoc),
-                    MutBorrowLoc(_) => {
-                        locals_bytecode!(locals_len, bytecode_idx, offset, MutBorrowLoc)
+                    MoveToGeneric(_) => struct_bytecode!(
+                        struct_inst_len,
+                        current_fdef,
+                        bytecode_idx,
+                        offset,
+                        StructDefInstantiationIndex,
+                        MoveToGeneric
+                    ),
+                    BrTrue(_) => {
+                        code_bytecode!(code_len, current_fdef, bytecode_idx, offset, BrTrue)
                     }
-                    ImmBorrowLoc(_) => {
-                        locals_bytecode!(locals_len, bytecode_idx, offset, ImmBorrowLoc)
+                    BrFalse(_) => {
+                        code_bytecode!(code_len, current_fdef, bytecode_idx, offset, BrFalse)
                     }
+                    Branch(_) => {
+                        code_bytecode!(code_len, current_fdef, bytecode_idx, offset, Branch)
+                    }
+                    CopyLoc(_) => {
+                        locals_bytecode!(locals_len, current_fdef, bytecode_idx, offset, CopyLoc)
+                    }
+                    MoveLoc(_) => {
+                        locals_bytecode!(locals_len, current_fdef, bytecode_idx, offset, MoveLoc)
+                    }
+                    StLoc(_) => {
+                        locals_bytecode!(locals_len, current_fdef, bytecode_idx, offset, StLoc)
+                    }
+                    MutBorrowLoc(_) => locals_bytecode!(
+                        locals_len,
+                        current_fdef,
+                        bytecode_idx,
+                        offset,
+                        MutBorrowLoc
+                    ),
+                    ImmBorrowLoc(_) => locals_bytecode!(
+                        locals_len,
+                        current_fdef,
+                        bytecode_idx,
+                        offset,
+                        ImmBorrowLoc
+                    ),
 
                     // List out the other options explicitly so there's a compile error if a new
                     // bytecode gets added.
-                    FreezeRef | Pop | Ret | LdConst(_) | LdTrue | LdFalse | ReadRef | WriteRef
-                    | Add | Sub | Mul | Mod | Div | BitOr | BitAnd | Xor | Or | And | Not | Eq
-                    | Neq | Lt | Gt | Le | Ge | Abort | GetTxnGasUnitPrice | GetTxnMaxGasUnits
-                    | GetGasRemaining | GetTxnSenderAddress | CreateAccount
-                    | GetTxnSequenceNumber | GetTxnPublicKey => {
+                    FreezeRef | Pop | Ret | LdU8(_) | LdU64(_) | LdU128(_) | CastU8 | CastU64
+                    | CastU128 | LdTrue | LdFalse | ReadRef | WriteRef | Add | Sub | Mul | Mod
+                    | Div | BitOr | BitAnd | Xor | Shl | Shr | Or | And | Not | Eq | Neq | Lt
+                    | Gt | Le | Ge | Abort | Nop => {
                         panic!("Bytecode has no internal index: {:?}", code[bytecode_idx])
                     }
                 };
 
                 code[bytecode_idx] = new_bytecode;
 
-                append_err_info(err, IndexKind::FunctionDefinition, idx)
+                err.at_index(IndexKind::FunctionDefinition, fidx as TableIndex)
             })
             .collect()
     }
@@ -310,19 +415,27 @@ fn is_interesting(bytecode: &Bytecode) -> bool {
     use Bytecode::*;
 
     match bytecode {
-        LdAddr(_)
-        | LdStr(_)
-        | LdByteArray(_)
+        LdConst(_)
         | ImmBorrowField(_)
+        | ImmBorrowFieldGeneric(_)
         | MutBorrowField(_)
-        | Call(_, _)
-        | Pack(_, _)
-        | Unpack(_, _)
-        | Exists(_, _)
-        | MutBorrowGlobal(_, _)
-        | ImmBorrowGlobal(_, _)
-        | MoveFrom(_, _)
-        | MoveToSender(_, _)
+        | MutBorrowFieldGeneric(_)
+        | Call(_)
+        | CallGeneric(_)
+        | Pack(_)
+        | PackGeneric(_)
+        | Unpack(_)
+        | UnpackGeneric(_)
+        | Exists(_)
+        | ExistsGeneric(_)
+        | MutBorrowGlobal(_)
+        | MutBorrowGlobalGeneric(_)
+        | ImmBorrowGlobal(_)
+        | ImmBorrowGlobalGeneric(_)
+        | MoveFrom(_)
+        | MoveFromGeneric(_)
+        | MoveTo(_)
+        | MoveToGeneric(_)
         | BrTrue(_)
         | BrFalse(_)
         | Branch(_)
@@ -334,9 +447,8 @@ fn is_interesting(bytecode: &Bytecode) -> bool {
 
         // List out the other options explicitly so there's a compile error if a new
         // bytecode gets added.
-        FreezeRef | Pop | Ret | LdConst(_) | LdTrue | LdFalse | ReadRef | WriteRef | Add | Sub
-        | Mul | Mod | Div | BitOr | BitAnd | Xor | Or | And | Not | Eq | Neq | Lt | Gt | Le
-        | Ge | Abort | GetTxnGasUnitPrice | GetTxnMaxGasUnits | GetGasRemaining
-        | GetTxnSenderAddress | CreateAccount | GetTxnSequenceNumber | GetTxnPublicKey => false,
+        FreezeRef | Pop | Ret | LdU8(_) | LdU64(_) | LdU128(_) | CastU8 | CastU64 | CastU128
+        | LdTrue | LdFalse | ReadRef | WriteRef | Add | Sub | Mul | Mod | Div | BitOr | BitAnd
+        | Xor | Shl | Shr | Or | And | Not | Eq | Neq | Lt | Gt | Le | Ge | Abort | Nop => false,
     }
 }

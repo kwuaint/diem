@@ -1,15 +1,33 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! This crate contains three types of derive macros:
+#![forbid(unsafe_code)]
+
+//! # Derive macros for crypto operations
+//! This crate contains four types of derive macros:
+//!
 //! - the `SilentDebug` and SilentDisplay macros are meant to be used on private key types, and
 //!   elide their input for confidentiality.
 //! - the `Deref` macro helps derive the canonical instances on new types.
-//! - the derive macros for `libra_crypto::traits`, namely `ValidKey`, `PublicKey`, `PrivateKey`,
+//! - the derive macros for `libra_crypto::traits`, namely `ValidCryptoMaterial`, `PublicKey`, `PrivateKey`,
 //!   `VerifyingKey`, `SigningKey` and `Signature` are meant to be derived on simple unions of types
 //!   implementing these traits.
+//! - the derive macro for `libra_crypto::hash::CryptoHasher`, which defines
+//!   the domain-separation hasher structures described in `libra_crypto::hash`
+//!   (look there for details). This derive macro has for sole difference that it
+//!   automatically picks a unique salt for you, using the Serde name. For a container `Foo`,
+//!   this is usually equivalent to:
+//!   ```ignore
+//!   define_hasher! {
+//!    (
+//!         FooHasher,
+//!         FOO_HASHER,
+//!         b"Foo"
+//!     )
+//!   }
+//!   ```
 //!
-//! ## Unions of Signing Traits, in detail
+//! # Unions of Signing Traits, in detail
 //!
 //! Those types typically come into play when you need to accept several
 //! alternatives at runtime for several signature and verification schemes
@@ -39,13 +57,12 @@
 //!     ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature},
 //! };
 //! use libra_crypto_derive::{
-//!     SilentDebug, PrivateKey, PublicKey, Signature, SigningKey, ValidKey, VerifyingKey,
+//!     SilentDebug, PrivateKey, PublicKey, Signature, SigningKey, ValidCryptoMaterial, VerifyingKey,
 //! };
 //!
-//! # fn main() {
 //! /// Generic public key enum
 //! #[derive(
-//!     Debug, Clone, PartialEq, Eq, Hash, ValidKey, PublicKey, VerifyingKey,
+//!     Debug, Clone, PartialEq, Eq, Hash, ValidCryptoMaterial, PublicKey, VerifyingKey,
 //! )]
 //! #[PrivateKeyType = "GenericPrivateKey"]
 //! #[SignatureType = "GenericSignature"]
@@ -56,7 +73,7 @@
 //!     BLS(BLS12381PublicKey),
 //! }
 //! /// Generic private key enum
-//! #[derive(SilentDebug, ValidKey, PrivateKey, SigningKey)]
+//! #[derive(SilentDebug, ValidCryptoMaterial, PrivateKey, SigningKey)]
 //! #[PublicKeyType = "GenericPublicKey"]
 //! #[SignatureType = "GenericSignature"]
 //! pub enum GenericPrivateKey {
@@ -76,14 +93,22 @@
 //!     /// BLS12-381 signature
 //!     BLS(BLS12381Signature),
 //! }
-//! # }
 //! ```
+
+#![forbid(unsafe_code)]
 
 extern crate proc_macro;
 
+mod hasher;
+mod unions;
+
+use hasher::camel_to_snake;
 use proc_macro::TokenStream;
+use proc_macro2::Span;
 use quote::quote;
-use syn::{parse_macro_input, Data, DataEnum, DeriveInput, Ident};
+use std::iter::FromIterator;
+use syn::{parse_macro_input, parse_quote, Data, DeriveInput, Ident};
+use unions::*;
 
 #[proc_macro_derive(SilentDisplay)]
 pub fn silent_display(source: TokenStream) -> TokenStream {
@@ -115,30 +140,68 @@ pub fn silent_debug(source: TokenStream) -> TokenStream {
     gen.into()
 }
 
-fn parse_newtype_fields(item: &syn::DeriveInput) -> (syn::Type, proc_macro2::TokenStream) {
-    let fields = match item.data {
-        syn::Data::Struct(ref body) => body.fields.iter().collect::<Vec<&syn::Field>>(),
-        _ => panic!("#[derive(Deref)] can only be used on structs"),
-    };
+/// Deserialize from a human readable format where applicable
+#[proc_macro_derive(DeserializeKey)]
+pub fn deserialize_key(source: TokenStream) -> TokenStream {
+    let ast: DeriveInput = syn::parse(source).expect("Incorrect macro input");
+    let name = &ast.ident;
+    let name_string = name.to_string();
+    let gen = quote! {
+        impl<'de> ::serde::Deserialize<'de> for #name {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: ::serde::Deserializer<'de>,
+            {
+                if deserializer.is_human_readable() {
+                    let encoded_key = <String>::deserialize(deserializer)?;
+                    ValidCryptoMaterialStringExt::from_encoded_string(encoded_key.as_str())
+                        .map_err(<D::Error as ::serde::de::Error>::custom)
+                } else {
+                    // In order to preserve the Serde data model and help analysis tools,
+                    // make sure to wrap our value in a container with the same name
+                    // as the original type.
+                    #[derive(::serde::Deserialize)]
+                    #[serde(rename = #name_string)]
+                    struct Value<'a>(&'a [u8]);
 
-    let field_ty = match fields.len() {
-        1 => Some(fields[0].ty.clone()),
-        _ => None,
-    };
-    let field_ty = field_ty
-        .unwrap_or_else(|| panic!("#[derive(Deref)] can only be used on structs with one field."));
-
-    let field_name = match fields[0].ident {
-        Some(ref ident) => quote!(#ident),
-        None => quote!(0),
-    };
-
-    match field_ty {
-        syn::Type::Reference(syn::TypeReference { elem, .. }) => {
-            (*elem.clone(), quote!(self.#field_name))
+                    let value = Value::deserialize(deserializer)?;
+                    #name::try_from(value.0).map_err(|s| {
+                        <D::Error as ::serde::de::Error>::custom(format!("{} with {}", s, #name_string))
+                    })
+                }
+            }
         }
-        x => (x, quote!(&self.#field_name)),
-    }
+    };
+    gen.into()
+}
+
+/// Serialize into a human readable format where applicable
+#[proc_macro_derive(SerializeKey)]
+pub fn serialize_key(source: TokenStream) -> TokenStream {
+    let ast: DeriveInput = syn::parse(source).expect("Incorrect macro input");
+    let name = &ast.ident;
+    let name_string = name.to_string();
+    let gen = quote! {
+        impl ::serde::Serialize for #name {
+            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: ::serde::Serializer,
+            {
+                if serializer.is_human_readable() {
+                    self.to_encoded_string()
+                        .map_err(<S::Error as ::serde::ser::Error>::custom)
+                        .and_then(|str| serializer.serialize_str(&str[..]))
+                } else {
+                    // See comment in deserialize_key.
+                    serializer.serialize_newtype_struct(
+                        #name_string,
+                        serde_bytes::Bytes::new(&ValidCryptoMaterial::to_bytes(self).as_slice()),
+                    )
+                }
+            }
+        }
+    };
+    gen.into()
 }
 
 #[proc_macro_derive(Deref)]
@@ -163,86 +226,17 @@ pub fn derive_deref(input: TokenStream) -> TokenStream {
     .into()
 }
 
-#[proc_macro_derive(ValidKey)]
-pub fn derive_enum_validkey(input: TokenStream) -> TokenStream {
+#[proc_macro_derive(ValidCryptoMaterial)]
+pub fn derive_enum_valid_crypto_material(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
 
     let name = &ast.ident;
     match ast.data {
-        Data::Enum(ref variants) => impl_enum_validkey(name, variants),
-        Data::Struct(_) | Data::Union(_) => panic!("#[derive(ValidKey)] is only defined for enums"),
-    }
-}
-
-fn impl_enum_tryfrom(name: &Ident, variants: &DataEnum) -> proc_macro2::TokenStream {
-    // the TryFrom dispatch
-    let mut try_iter = variants.variants.iter();
-    let first_variant = try_iter
-        .next()
-        .expect("#[derive(ValidKey] requires a non-empty enum.");
-    let first_variant_ident = &first_variant.ident;
-    let first_variant_arg = &first_variant
-        .fields
-        .iter()
-        .next()
-        .expect("Unrecognized enum for key types")
-        .ty;
-
-    let mut try_chain = quote! {
-        #first_variant_arg::try_from(bytes).and_then(|key| Ok(#name::#first_variant_ident(key)))
-    };
-    for variant in try_iter {
-        let variant_ident = &variant.ident;
-        let variant_arg = &variant
-            .fields
-            .iter()
-            .next()
-            .expect("Unrecognized enum for key types")
-            .ty;
-        try_chain.extend(quote!{
-            .or_else(|_err| #variant_arg::try_from(bytes).and_then(|key| Ok(#name::#variant_ident(key))))
-        })
-    }
-
-    quote! {
-        impl core::convert::TryFrom<&[u8]> for #name {
-            type Error = libra_crypto::CryptoMaterialError;
-            fn try_from(bytes: &[u8]) -> std::result::Result<#name, Self::Error> {
-                #try_chain
-            }
+        Data::Enum(ref variants) => impl_enum_valid_crypto_material(name, variants),
+        Data::Struct(_) | Data::Union(_) => {
+            panic!("#[derive(ValidCryptoMaterial)] is only defined for enums")
         }
     }
-}
-
-fn match_enum_to_bytes(name: &Ident, variants: &DataEnum) -> proc_macro2::TokenStream {
-    // the ValidKey dispatch proper
-    let mut match_arms = quote! {};
-    for variant in variants.variants.iter() {
-        let variant_ident = &variant.ident;
-
-        match_arms.extend(quote! {
-            #name::#variant_ident(key) => key.to_bytes().to_vec(),
-        });
-    }
-    match_arms
-}
-
-fn impl_enum_validkey(name: &Ident, variants: &DataEnum) -> TokenStream {
-    let mut try_from = impl_enum_tryfrom(name, variants);
-
-    let to_bytes_arms = match_enum_to_bytes(name, variants);
-
-    try_from.extend(quote! {
-
-        impl libra_crypto::ValidKey for #name {
-            fn to_bytes(&self) -> Vec<u8> {
-                match self {
-                    #to_bytes_arms
-                }
-            }
-        }
-    });
-    try_from.into()
 }
 
 #[proc_macro_derive(PublicKey, attributes(PrivateKeyType))]
@@ -259,67 +253,6 @@ pub fn derive_enum_publickey(input: TokenStream) -> TokenStream {
     }
 }
 
-fn get_type_from_attrs(attrs: &[syn::Attribute], attr_name: &str) -> syn::Result<syn::LitStr> {
-    for attr in attrs {
-        if !attr.path.is_ident(attr_name) {
-            continue;
-        }
-        match attr.parse_meta()? {
-            syn::Meta::NameValue(meta) => {
-                if let syn::Lit::Str(lit) = &meta.lit {
-                    return Ok(lit.clone());
-                } else {
-                    return Err(syn::Error::new_spanned(
-                        meta,
-                        &format!("Could not parse {} attribute", attr_name)[..],
-                    ));
-                }
-            }
-            bad => {
-                return Err(syn::Error::new_spanned(
-                    bad,
-                    &format!("Could not parse {} attribute", attr_name)[..],
-                ))
-            }
-        }
-    }
-    Err(syn::Error::new(
-        proc_macro2::Span::call_site(),
-        format!("Could not find attribute {}", attr_name),
-    ))
-}
-
-fn impl_enum_publickey(
-    name: &Ident,
-    private_key_type: syn::LitStr,
-    variants: &DataEnum,
-) -> TokenStream {
-    let pkt: syn::Type = private_key_type.parse().unwrap();
-    let mut from_match_arms = quote! {};
-    for variant in variants.variants.iter() {
-        let variant_ident = &variant.ident;
-
-        from_match_arms.extend(quote! {
-            #pkt::#variant_ident(key) => #name::#variant_ident(key.into()),
-        });
-    }
-    let mut res = quote! {
-        impl From<&#pkt> for #name {
-            fn from(public_key: &#pkt) -> Self {
-                match public_key {
-                    #from_match_arms
-                }
-            }
-        }
-    };
-    res.extend(quote! {
-        impl libra_crypto::PublicKey for #name {
-            type PrivateKeyMaterial = #pkt;
-        }
-    });
-    res.into()
-}
-
 #[proc_macro_derive(PrivateKey, attributes(PublicKeyType))]
 pub fn derive_enum_privatekey(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
@@ -332,20 +265,6 @@ pub fn derive_enum_privatekey(input: TokenStream) -> TokenStream {
             panic!("#[derive(PrivateKey)] is only defined for enums")
         }
     }
-}
-
-fn impl_enum_privatekey(
-    name: &Ident,
-    public_key_type: syn::LitStr,
-    _variants: &DataEnum,
-) -> TokenStream {
-    let pkt: syn::Type = public_key_type.parse().unwrap();
-    let res = quote! {
-        impl libra_crypto::PrivateKey for #name {
-            type PublicKeyMaterial = #pkt;
-        }
-    };
-    res.into()
 }
 
 #[proc_macro_derive(VerifyingKey, attributes(PrivateKeyType, SignatureType))]
@@ -365,23 +284,6 @@ pub fn derive_enum_verifyingkey(input: TokenStream) -> TokenStream {
     }
 }
 
-fn impl_enum_verifyingkey(
-    name: &Ident,
-    private_key_type: syn::LitStr,
-    signature_type: syn::LitStr,
-    _variants: &DataEnum,
-) -> TokenStream {
-    let pkt: syn::Type = private_key_type.parse().unwrap();
-    let st: syn::Type = signature_type.parse().unwrap();
-    let res = quote! {
-        impl libra_crypto::VerifyingKey for #name {
-            type SigningKeyMaterial = #pkt;
-            type SignatureMaterial = #st;
-        }
-    };
-    res.into()
-}
-
 #[proc_macro_derive(SigningKey, attributes(PublicKeyType, SignatureType))]
 pub fn derive_enum_signingkey(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
@@ -397,38 +299,6 @@ pub fn derive_enum_signingkey(input: TokenStream) -> TokenStream {
             panic!("#[derive(PrivateKey)] is only defined for enums")
         }
     }
-}
-
-fn impl_enum_signingkey(
-    name: &Ident,
-    public_key_type: syn::LitStr,
-    signature_type: syn::LitStr,
-    variants: &DataEnum,
-) -> TokenStream {
-    let pkt: syn::Type = public_key_type.parse().unwrap();
-    let st: syn::Type = signature_type.parse().unwrap();
-
-    let mut match_arms = quote! {};
-    for variant in variants.variants.iter() {
-        let variant_ident = &variant.ident;
-
-        match_arms.extend(quote! {
-            #name::#variant_ident(key) => Self::SignatureMaterial::#variant_ident(key.sign_message(message)),
-        });
-    }
-    let res = quote! {
-        impl libra_crypto::SigningKey for #name {
-            type VerifyingKeyMaterial = #pkt;
-            type SignatureMaterial = #st;
-
-            fn sign_message(&self, message: &libra_crypto::HashValue) -> Self::SignatureMaterial {
-                match self {
-                    #match_arms
-                }
-            }
-        }
-    };
-    res.into()
 }
 
 #[proc_macro_derive(Signature, attributes(PublicKeyType, PrivateKeyType))]
@@ -448,54 +318,129 @@ pub fn derive_enum_signature(input: TokenStream) -> TokenStream {
     }
 }
 
-fn impl_enum_signature(
-    name: &Ident,
-    public_key_type: syn::LitStr,
-    private_key_type: syn::LitStr,
-    variants: &DataEnum,
-) -> TokenStream {
-    let priv_kt: syn::Type = private_key_type.parse().unwrap();
-    let pub_kt: syn::Type = public_key_type.parse().unwrap();
-    let mut res = impl_enum_tryfrom(name, variants);
-    let to_bytes_arms = match_enum_to_bytes(name, variants);
+// There is a unit test for this logic in the crypto crate, at
+// libra_crypto::unit_tests::cryptohasher — you may have to modify it if you
+// edit the below.
+#[proc_macro_derive(CryptoHasher)]
+pub fn hasher_dispatch(input: TokenStream) -> TokenStream {
+    let item = parse_macro_input!(input as DeriveInput);
+    let hasher_name = Ident::new(
+        &format!("{}Hasher", &item.ident.to_string()),
+        Span::call_site(),
+    );
+    let snake_name = camel_to_snake(&item.ident.to_string());
+    let static_seed_name = Ident::new(
+        &format!("{}_SEED", snake_name.to_uppercase()),
+        Span::call_site(),
+    );
 
-    let mut match_arms = quote! {};
-    for variant in variants.variants.iter() {
-        let variant_ident = &variant.ident;
+    let static_hasher_name = Ident::new(
+        &format!("{}_HASHER", snake_name.to_uppercase()),
+        Span::call_site(),
+    );
+    let type_name = &item.ident;
+    let param = if item.generics.params.is_empty() {
+        quote!()
+    } else {
+        let args = proc_macro2::TokenStream::from_iter(
+            std::iter::repeat(quote!(())).take(item.generics.params.len()),
+        );
+        quote!(<#args>)
+    };
 
-        match_arms.extend(quote! {
-            (#name::#variant_ident(sig), #pub_kt::#variant_ident(pk)) => {
-                sig.verify_arbitrary_msg(message, pk)
-            }
-        })
-    }
+    let out = quote!(
+        /// Cryptographic hasher for an LCS-serializable #item
+        #[derive(Clone)]
+        pub struct #hasher_name(libra_crypto::hash::DefaultHasher);
 
-    res.extend(quote! {
+        static #static_seed_name: libra_crypto::_once_cell::sync::OnceCell<[u8; 32]> = libra_crypto::_once_cell::sync::OnceCell::new();
 
-        impl libra_crypto::Signature for #name {
-            type VerifyingKeyMaterial = #pub_kt;
-            type SigningKeyMaterial = #priv_kt;
-
-            fn verify(&self, message: &HashValue, public_key: &Self::VerifyingKeyMaterial) -> ::std::result::Result<(), ::failure::Error> {
-                self.verify_arbitrary_msg(message.as_ref(), public_key)
-            }
-
-            fn verify_arbitrary_msg(&self, message: &[u8], public_key: &Self::VerifyingKeyMaterial) -> std::result::Result<(), ::failure::Error> {
-                match (self, public_key) {
-                    #match_arms
-                    _ => ::failure::bail!(
-                        "provided the wrong alternative in {:?}!",
-                        (self, public_key)
-                    ),
-                }
-            }
-
-            fn to_bytes(&self) -> Vec<u8> {
-                match self {
-                    #to_bytes_arms
-                }
+        impl #hasher_name {
+            fn new() -> Self {
+                let name = libra_crypto::_serde_name::trace_name::<#type_name #param>()
+                    .expect("The `CryptoHasher` macro only applies to structs and enums");
+                #hasher_name(
+                    libra_crypto::hash::DefaultHasher::new(&name.as_bytes()))
             }
         }
-    });
-    res.into()
+
+        static #static_hasher_name: libra_crypto::_once_cell::sync::Lazy<#hasher_name> =
+            libra_crypto::_once_cell::sync::Lazy::new(|| #hasher_name::new());
+
+
+        impl std::default::Default for #hasher_name
+        {
+            fn default() -> Self {
+                #static_hasher_name.clone()
+            }
+        }
+
+        impl libra_crypto::hash::CryptoHasher for #hasher_name {
+            fn seed() -> &'static [u8; 32] {
+                #static_seed_name.get_or_init(|| {
+                    let name = libra_crypto::_serde_name::trace_name::<#type_name #param>()
+                        .expect("The `CryptoHasher` macro only applies to structs and enums.").as_bytes();
+                    libra_crypto::hash::DefaultHasher::prefixed_hash(&name)
+                })
+            }
+
+            fn update(&mut self, bytes: &[u8]) {
+                self.0.update(bytes);
+            }
+
+            fn finish(self) -> libra_crypto::hash::HashValue {
+                self.0.finish()
+            }
+        }
+
+        impl std::io::Write for #hasher_name {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                use libra_crypto::hash::CryptoHasher;
+
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+    );
+    out.into()
+}
+
+#[proc_macro_derive(LCSCryptoHash)]
+pub fn lcs_crypto_hash_dispatch(input: TokenStream) -> TokenStream {
+    let ast = parse_macro_input!(input as DeriveInput);
+    let name = &ast.ident;
+    let hasher_name = Ident::new(&format!("{}Hasher", &name.to_string()), Span::call_site());
+    let error_msg = syn::LitStr::new(
+        &format!("LCS serialization of {} should not fail", name.to_string()),
+        Span::call_site(),
+    );
+    let generics = add_trait_bounds(ast.generics);
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let out = quote!(
+        impl #impl_generics libra_crypto::hash::CryptoHash for #name #ty_generics #where_clause {
+            type Hasher = #hasher_name;
+
+            fn hash(&self) -> libra_crypto::hash::HashValue {
+                use libra_crypto::hash::CryptoHasher;
+
+                let mut state = Self::Hasher::default();
+                lcs::serialize_into(&mut state, &self).expect(#error_msg);
+                state.finish()
+            }
+        }
+    );
+    out.into()
+}
+
+fn add_trait_bounds(mut generics: syn::Generics) -> syn::Generics {
+    for param in generics.params.iter_mut() {
+        if let syn::GenericParam::Type(type_param) = param {
+            type_param.bounds.push(parse_quote!(Serialize));
+        }
+    }
+    generics
 }

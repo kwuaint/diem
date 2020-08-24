@@ -20,7 +20,7 @@ libra$ cargo fmt
 [Clippy](https://github.com/rust-lang/rust-clippy) is used to catch common mistakes and is run as a part of continuous integration.  Before submitting your code for review, you can run clippy with our configuration:
 
 ```
-libra$ ./scripts/clippy.sh
+libra$ cargo xclippy
 ```
 
 In general, we follow the recommendations from [rust-lang-nursery](https://rust-lang-nursery.github.io/api-guidelines/about.html).  The remainder of this guide provides detailed guidelines on specific topics in order to achieve uniformity of the codebase.
@@ -52,6 +52,14 @@ struct Point {
     y: i32,
 }
 ```
+
+### Terminology
+
+The Libra codebase uses inclusive terminology (similar to other projects such as [the Linux kernel](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=49decddd39e5f6132ccd7d9fdc3d7c470b0061bb)).  The terms below are recommended when appropriate.
+* allowlist - a set of entities allowed access
+* blocklist - a set of entities that are blocked from access
+* primary/leader/main - a primary entity
+* secondary/replica/follower - a secondary entity
 
 ### Constants and fields
 
@@ -186,7 +194,6 @@ Error handling suggestions follow the [Rust book guidance](https://doc.rust-lang
 
 *Panic*
 
-* `panic!()` - Runtime panic! should only be used when the resulting state cannot be processed going forward.  It should not be used for any recoverable errors.
 * `unwrap()` - Unwrap should only be used for mutexes (e.g. `lock().unwrap()`) and test code.  For all other use cases, prefer `expect()`. The only exception is if the error message is custom-generated, in which case use `.unwrap_or_else(|| panic!("error: {}", foo))`
 * `expect()` - Expect should be invoked when a system invariant is expected to be preserved.  `expect()` is preferred over `unwrap()` and should contain a detailed error message on failure in most cases.
 * `assert!()` - This macro is kept in both debug/release and should be used to protect invariants of the system as necessary
@@ -235,13 +242,13 @@ impl Foo {
 
 ### Logging
 
-We currently use [slog](https://docs.rs/slog/) for logging.
+We currently use [log](https://docs.rs/log/) for logging.
 
-* [error!](https://docs.rs/slog/2.4.1/slog/macro.error.html) - Error-level messages have the highest urgency in [slog](https://docs.rs/slog/).  An unexpected error has occurred (e.g. exceeded the maximum number of retries to complete an RPC or inability to store data to local storage).
-* [warn!](https://docs.rs/slog/2.4.1/slog/macro.warn.html) - Warn-level messages help notify admins about automatically handled issues (e.g. retrying a failed network connection or receiving the same message multiple times, etc.).
-* [info!](https://docs.rs/slog/2.4.1/slog/macro.info.html) - Info-level messages are well suited for "one-time" events (such as logging state on one-time startup and shutdown) or periodic events that are not frequently occurring - e.g. changing the validator set every day.
-* [debug!](https://docs.rs/slog/2.4.1/slog/macro.debug.html) - Debug-level messages can occur frequently (i.e. potentially > 1 message per second) and are not typically expected to be enabled in production.
-* [trace!](https://docs.rs/slog/2.4.1/slog/macro.trace.html) - Trace-level logging is typically only used for function entry/exit.
+* [error!](https://docs.rs/log/0.4.10/log/macro.error.html) - Error-level messages have the highest urgency in [log](https://docs.rs/log/).  An unexpected error has occurred (e.g. exceeded the maximum number of retries to complete an RPC or inability to store data to local storage).
+* [warn!](https://docs.rs/log/0.4.4.10/log/macro.warn.html) - Warn-level messages help notify admins about automatically handled issues (e.g. retrying a failed network connection or receiving the same message multiple times, etc.).
+* [info!](https://docs.rs/log/0.4.4.10/log/macro.info.html) - Info-level messages are well suited for "one-time" events (such as logging state on one-time startup and shutdown) or periodic events that are not frequently occurring - e.g. changing the validator set every day.
+* [debug!](https://docs.rs/log/0.4.4.10/log/macro.debug.html) - Debug-level messages can occur frequently (i.e. potentially > 1 message per second) and are not typically expected to be enabled in production.
+* [trace!](https://docs.rs/log/0.4.4.10/log/macro.trace.html) - Trace-level logging is typically only used for function entry/exit.
 
 ### Testing
 
@@ -275,7 +282,11 @@ References:
 * [An introduction to property-based testing](https://fsharpforfunandprofit.com/posts/property-based-testing/)
 * [Choosing properties for property-based testing](https://fsharpforfunandprofit.com/posts/property-based-testing-2/)
 
-*Conditional compilation of tests*
+*Fuzzing*
+
+Libra contains harnesses for fuzzing crash-prone code like deserializers, using [`libFuzzer`](https://llvm.org/docs/LibFuzzer.html) through [`cargo fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html). For more examples, see the `testsuite/libra_fuzzer` directory.
+
+### Conditional compilation of tests
 
 Libra [conditionally
 compiles](https://doc.rust-lang.org/stable/reference/conditional-compilation.html)
@@ -287,38 +298,57 @@ in tests/benchmarks](https://github.com/rust-lang/cargo/issues/2911), we rely on
 conditions to perform this conditional compilation:
 - the test flag, which is activated by dependent test code in the same crate
   as the conditional test-only code.
-- the "fuzzing" custom feature, which is used to enable fuzzing and testing
+- the `fuzzing` custom feature, which is used to enable fuzzing and testing
 related code in downstream crates. Note that this must be passed explicitly to
-`cargo test` and `cargo bench`. Never use this in `[dependencies]` or
-`[dev-dependencies]` unless the crate is only for testing, otherwise Cargo's
-feature unification may pollute production code with the extra testing/fuzzing code.
+`cargo xtest` and `cargo x bench`. Never use this in `[dependencies]` unless
+the crate is only for testing.
 
-As a consequence, it is recommended that you set up your test-only code in the following fashion. For the sake of example, we'll consider you are defining a test-only helper function `foo` in `foo_crate`:
-1. Define the "testing" flag in `foo_crate/Cargo.toml` and make it non-default:
-    ```
+As a consequence, it is recommended that you set up your test-only code in the following fashion.
+
+**For production crates:**
+
+Production crates are defined as the set of crates that create externally published artifacts, e.g. the Libra validator,
+the Move compiler, and so on.
+
+For the sake of example, we'll consider you are defining a test-only helper function `foo` in `foo_crate`:
+
+1. Define the `fuzzing` flag in `foo_crate/Cargo.toml` and make it non-default:
+    ```toml
     [features]
     default = []
     fuzzing = []
     ```
 2. Annotate your test-only helper `foo` with both the `test` flag (for in-crate callers) and the `"fuzzing"` custom feature (for out-of-crate callers):
-    ```
+    ```rust
     #[cfg(any(test, feature = "fuzzing"))]
     fn foo() { ... }
     ```
 3. (optional) Use `cfg_attr` to make test-only trait derivations conditional:
-    ```
+    ```rust
     #[cfg_attr(any(test, feature = "testing"), derive(FooTrait))]
     #[derive(Debug, Display, ...)] // inconditional derivations
     struct Foo { ... }
     ```
-4. (optional) Set up feature transitivitity for crates that call crates that have test-only members. Let's say it's the case of `bar_crate`, which, through its test helpers, calls into `foo_crate` to use your test-only `foo`. Here's how you would set up `bar_crate/Cargo.toml`:
-    ```
+4. (optional) Set up feature transitivity for crates that call crates that have test-only members. Let's say it's the case of `bar_crate`, which, through its test helpers, calls into `foo_crate` to use your test-only `foo`. Here's how you would set up `bar_crate/Cargo.toml`:
+    ```toml
     [features]
     default = []
-    testing = ["foo_crate/testing"]
+    fuzzing = ["foo_crate/fuzzing"]
     ```
-5. Update `x/src/test_unit.rs` to run the unit tests passing in the
-   features if needed.
+
+**For test-only crates:**
+
+Test-only crates do not create published artifacts. They consist of tests, benchmarks or other code that verifies
+the correctness or performance of published artifacts. Test-only crates are
+explicitly listed in `x.toml` under `[workspace.test-only]`.
+
+These crates do not need to use the above setup. Instead, they can enable the `fuzzing` feature in production crates
+directly.
+
+```toml
+[dependencies]
+foo_crate = { path = "...", features = ["fuzzing"] }
+```
 
 *A final note on integration tests*: All tests that use conditional test-only
 elements in another crate need to activate the "fuzzing" feature through the
@@ -327,11 +357,7 @@ tests](https://doc.rust-lang.org/rust-by-example/testing/integration_testing.htm
 can neither rely on the `test` flag nor do they have a proper `Cargo.toml` for
 feature activation. In the Libra codebase, we therefore recommend that
 *integration tests which depend on test-only code in their tested crate* be
-extracted to their own crate. You can look at `language/vm/serializer_tests`
+extracted to their own test-only crate. See `language/vm/serializer_tests`
 for an example of such an extracted integration test.
 
 *Note for developers*: The reason we use a feature re-export (in the `[features]` section of the `Cargo.toml` is that a profile is not enough to activate the `"fuzzing"` feature flag. See [cargo-issue #291](https://github.com/rust-lang/cargo/issues/2911) for details).
-
-*Fuzzing*
-
-Libra contains harnesses for fuzzing crash-prone code like deserializers, using [`libFuzzer`](https://llvm.org/docs/LibFuzzer.html) through [`cargo fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html). For more examples, see the `testsuite/libra_fuzzer` directory.

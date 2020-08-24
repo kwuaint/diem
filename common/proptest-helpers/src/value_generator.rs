@@ -3,7 +3,7 @@
 
 use proptest::{
     strategy::{Strategy, ValueTree},
-    test_runner::{Config, TestRunner},
+    test_runner::{Config, TestRng, TestRunner},
 };
 
 /// Context for generating single values out of strategies.
@@ -11,6 +11,7 @@ use proptest::{
 /// Proptest is designed to be built around "value trees", which represent a spectrum from complex
 /// values to simpler ones. But in some contexts, like benchmarking or generating corpuses, one just
 /// wants a single value. This is a convenience struct for that.
+#[derive(Default)]
 pub struct ValueGenerator {
     runner: TestRunner,
 }
@@ -18,8 +19,13 @@ pub struct ValueGenerator {
 impl ValueGenerator {
     /// Creates a new value generator with the default RNG.
     pub fn new() -> Self {
+        Default::default()
+    }
+
+    /// Creates a new value generator with provided RNG
+    pub fn new_with_rng(rng: TestRng) -> Self {
         Self {
-            runner: TestRunner::new(Config::default()),
+            runner: TestRunner::new_with_rng(Config::default(), rng),
         }
     }
 

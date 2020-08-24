@@ -2,100 +2,78 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::block::Block;
-use failure::prelude::{Error, Result};
-use libra_crypto::hash::HashValue;
-use libra_types::{transaction::Version, validator_set::ValidatorSet};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use libra_crypto::{ed25519::Ed25519Signature, hash::TransactionAccumulatorHasher};
+use libra_crypto_derive::{CryptoHasher, LCSCryptoHash};
+use libra_types::{epoch_state::EpochState, proof::AccumulatorExtensionProof};
+use serde::{Deserialize, Serialize};
 use std::{
-    convert::TryFrom,
     fmt::{Display, Formatter},
+    ops::Deref,
 };
 
 /// This structure contains all the information needed by safety rules to
 /// evaluate a proposal / block for correctness / safety and to produce a Vote.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct VoteProposal<T> {
+#[derive(Clone, CryptoHasher, Deserialize, LCSCryptoHash, Serialize)]
+pub struct VoteProposal {
+    /// Contains the data necessary to construct the parent's execution output state
+    /// and the childs in a verifiable way
+    accumulator_extension_proof: AccumulatorExtensionProof<TransactionAccumulatorHasher>,
     /// The block / proposal to evaluate
-    #[serde(bound(deserialize = "Block<T>: Deserialize<'de>"))]
-    block: Block<T>,
-    /// The accumulator root hash after executing this block.
-    executed_state_id: HashValue,
-    /// The version of the latest transaction in the ledger.
-    version: Version,
-    /// An optional field containing the set of validators for the start of the next epoch
-    next_validator_set: Option<ValidatorSet>,
+    #[serde(bound(deserialize = "Block: Deserialize<'de>"))]
+    block: Block,
+    /// An optional field containing the next epoch info.
+    next_epoch_state: Option<EpochState>,
 }
 
-impl<T> VoteProposal<T> {
+impl VoteProposal {
     pub fn new(
-        block: Block<T>,
-        executed_state_id: HashValue,
-        version: Version,
-        next_validator_set: Option<ValidatorSet>,
+        accumulator_extension_proof: AccumulatorExtensionProof<TransactionAccumulatorHasher>,
+        block: Block,
+        next_epoch_state: Option<EpochState>,
     ) -> Self {
         Self {
+            accumulator_extension_proof,
             block,
-            executed_state_id,
-            version,
-            next_validator_set,
+            next_epoch_state,
         }
     }
 
-    pub fn block(&self) -> &Block<T> {
+    pub fn accumulator_extension_proof(
+        &self,
+    ) -> &AccumulatorExtensionProof<TransactionAccumulatorHasher> {
+        &self.accumulator_extension_proof
+    }
+
+    pub fn block(&self) -> &Block {
         &self.block
     }
 
-    pub fn executed_state_id(&self) -> HashValue {
-        self.executed_state_id
-    }
-
-    pub fn next_validator_set(&self) -> Option<&ValidatorSet> {
-        self.next_validator_set.as_ref()
-    }
-
-    pub fn version(&self) -> Version {
-        self.version
+    pub fn next_epoch_state(&self) -> Option<&EpochState> {
+        self.next_epoch_state.as_ref()
     }
 }
 
-impl<T: PartialEq> Display for VoteProposal<T> {
+impl Display for VoteProposal {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "VoteProposal[block: {}, executed_state_id: {}, version: {}, next_validator_set: {}]",
-            self.block,
-            self.executed_state_id,
-            self.version,
-            self.next_validator_set
-                .as_ref()
-                .map_or("None".to_string(), |validator_set| format!(
-                    "{}",
-                    validator_set
-                )),
-        )
+        write!(f, "VoteProposal[block: {}]", self.block,)
     }
 }
 
-impl<T> TryFrom<VoteProposal<T>> for network::proto::VoteProposal
-where
-    T: Serialize + Default + PartialEq,
-{
-    type Error = Error;
+/// Wraps a vote_proposal and its signature.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct MaybeSignedVoteProposal {
+    /// The vote proposal to be signed.
+    pub vote_proposal: VoteProposal,
 
-    fn try_from(vote_proposal: VoteProposal<T>) -> Result<Self> {
-        Ok(Self {
-            bytes: lcs::to_bytes(&vote_proposal)?,
-        })
-    }
+    /// The signature of this proposal's hash from Libra Execution Correctness service. It is
+    /// an `Option` because the LEC can be configured to not sign the vote hash.
+    pub signature: Option<Ed25519Signature>,
 }
 
-impl<T> TryFrom<network::proto::VoteProposal> for VoteProposal<T>
-where
-    T: DeserializeOwned + Serialize,
-{
-    type Error = Error;
+impl Deref for MaybeSignedVoteProposal {
+    type Target = VoteProposal;
 
-    fn try_from(proto: network::proto::VoteProposal) -> Result<Self> {
-        Ok(lcs::from_bytes(&proto.bytes)?)
+    fn deref(&self) -> &VoteProposal {
+        &self.vote_proposal
     }
 }

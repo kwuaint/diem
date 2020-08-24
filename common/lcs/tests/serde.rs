@@ -4,11 +4,29 @@
 // For some reason deriving `Arbitrary` results in clippy firing a `unit_arg` violation
 #![allow(clippy::unit_arg)]
 
-use libra_canonical_serialization::{from_bytes, to_bytes, Error, MAX_SEQUENCE_LENGTH};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    convert::TryFrom,
+    fmt,
+};
+
 use proptest::prelude::*;
 use proptest_derive::Arbitrary;
+use rand::{rngs::StdRng, SeedableRng};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt};
+
+use libra_canonical_serialization::{
+    from_bytes, serialized_size, to_bytes, Error, MAX_CONTAINER_DEPTH, MAX_SEQUENCE_LENGTH,
+};
+use libra_crypto::{
+    ed25519::{
+        Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature, ED25519_PRIVATE_KEY_LENGTH,
+        ED25519_PUBLIC_KEY_LENGTH, ED25519_SIGNATURE_LENGTH,
+    },
+    multi_ed25519::{MultiEd25519PrivateKey, MultiEd25519PublicKey, MultiEd25519Signature},
+    test_utils::{TestLibraCrypto, TEST_SEED},
+    Signature, SigningKey, Uniform,
+};
 
 fn is_same<T>(t: T)
 where
@@ -17,9 +35,10 @@ where
     let bytes = to_bytes(&t).unwrap();
     let s: T = from_bytes(&bytes).unwrap();
     assert_eq!(t, s);
+    assert_eq!(bytes.len(), serialized_size(&t).unwrap());
 }
 
-//TODO deriving `Arbitrary` is currently broken for enum types
+// TODO deriving `Arbitrary` is currently broken for enum types
 // Once AltSysrq/proptest#163 is merged we can use `Arbitrary` again.
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 enum E {
@@ -32,22 +51,22 @@ enum E {
 #[test]
 fn test_enum() {
     let u = E::Unit;
-    let expected = vec![0, 0, 0, 0];
+    let expected = vec![0];
     assert_eq!(to_bytes(&u).unwrap(), expected);
     is_same(u);
 
     let n = E::Newtype(1);
-    let expected = vec![1, 0, 0, 0, 1, 0];
+    let expected = vec![1, 1, 0];
     assert_eq!(to_bytes(&n).unwrap(), expected);
     is_same(n);
 
     let t = E::Tuple(1, 2);
-    let expected = vec![2, 0, 0, 0, 1, 0, 2, 0];
+    let expected = vec![2, 1, 0, 2, 0];
     assert_eq!(to_bytes(&t).unwrap(), expected);
     is_same(t);
 
     let s = E::Struct { a: 1 };
-    let expected = vec![3, 0, 0, 0, 1, 0, 0, 0];
+    let expected = vec![3, 1, 0, 0, 0];
     assert_eq!(to_bytes(&s).unwrap(), expected);
     is_same(s);
 }
@@ -63,7 +82,7 @@ struct S {
 proptest! {
     #[test]
     fn proptest_bool(v in any::<bool>()) {
-        assert_eq!(to_bytes(&v)?, vec![v.into()]);
+        assert_eq!(to_bytes(&v)?, vec![u8::from(v)]);
         is_same(v);
     }
 
@@ -130,7 +149,9 @@ proptest! {
     #[test]
     fn proptest_string(v in any::<String>()) {
         let mut expected = Vec::with_capacity(v.len() + 4);
-        expected.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        // Larger lengths have more complex uleb128 encodings.
+        prop_assume!(v.len() < 128);
+        expected.extend_from_slice(&(v.len() as u8).to_le_bytes());
         expected.extend_from_slice(v.as_bytes());
         assert_eq!(to_bytes(&v)?, expected);
 
@@ -140,7 +161,9 @@ proptest! {
     #[test]
     fn proptest_vec(v in any::<Vec<u8>>()) {
         let mut expected = Vec::with_capacity(v.len() + 4);
-        expected.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        // Larger lengths have more complex uleb128 encodings.
+        prop_assume!(v.len() < 128);
+        expected.extend_from_slice(&(v.len() as u8).to_le_bytes());
         expected.extend_from_slice(&v);
         assert_eq!(to_bytes(&v)?, expected);
 
@@ -183,24 +206,32 @@ proptest! {
     #[test]
     fn proptest_lexicographic_order(v in any::<BTreeMap<Vec<u8>, Vec<u8>>>()) {
         let bytes = to_bytes(&v).unwrap();
+        // This test assumes small maps and small vectors.
+        // This is what proptest always generates in practice but we will make
+        // the assumptions explicit anyway.
+        prop_assume!(v.len() < 128);
 
-        let v: BTreeMap<Vec<u8>, Vec<u8>> = v.into_iter().map(|(k, v)| {
+        let m : BTreeMap<Vec<u8>, Vec<u8>> = v.iter().filter_map(|(k, v)| {
+            if k.len() >= 128 || v.len() >= 128 {
+                return None;
+            }
             let mut k_bytes = Vec::with_capacity(k.len() + 4);
-            k_bytes.extend_from_slice(&(k.len() as u32).to_le_bytes());
-            k_bytes.extend(k.into_iter());
+            k_bytes.extend_from_slice(&(k.len() as u8).to_le_bytes());
+            k_bytes.extend(k.iter());
             let mut v_bytes = Vec::with_capacity(v.len() + 4);
-            v_bytes.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            v_bytes.extend(v.into_iter());
+            v_bytes.extend_from_slice(&(v.len() as u8).to_le_bytes());
+            v_bytes.extend(v.iter());
 
-            (k_bytes, v_bytes)
+            Some((k_bytes, v_bytes))
         })
         .collect();
+        prop_assume!(v.len() == m.len());
 
         let mut expected = Vec::with_capacity(bytes.len());
-        expected.extend_from_slice(&(v.len() as u32).to_le_bytes());
-        for (key, value) in v {
-            expected.extend(key.into_iter());
-            expected.extend(value.into_iter());
+        expected.extend_from_slice(&(m.len() as u8).to_le_bytes());
+        for (key, value) in m {
+            expected.extend(key.iter());
+            expected.extend(value.iter());
         }
 
         assert_eq!(expected, bytes);
@@ -234,24 +265,63 @@ proptest! {
 
 #[test]
 fn invalid_utf8() {
-    let invalid_utf8 = vec![1, 0, 0, 0, 0xFF];
+    let invalid_utf8 = vec![1, 0xFF];
     assert_eq!(from_bytes::<String>(&invalid_utf8), Err(Error::Utf8));
 }
 
 #[test]
-fn invalid_variant() {
-    #[derive(Serialize, Deserialize, Debug)]
+fn uleb_encoding_and_variant() {
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
     enum Test {
         One,
         Two,
     };
 
-    let invalid_variant = vec![5, 0, 0, 0];
-    match from_bytes::<Test>(&invalid_variant).unwrap_err() {
-        // Error message comes from serde
-        Error::Custom(_) => {}
-        _ => panic!(),
-    }
+    let valid_variant = vec![1];
+    from_bytes::<Test>(&valid_variant).unwrap();
+
+    let invalid_variant = vec![5];
+    // Error comes from serde
+    assert_eq!(
+        from_bytes::<Test>(&invalid_variant),
+        Err(Error::Custom(
+            "invalid value: integer `5`, expected variant index 0 <= i < 2".into()
+        ))
+    );
+
+    let invalid_bytes = vec![0x80, 0x80, 0x80, 0x80];
+    // Error is due to EOF.
+    assert_eq!(from_bytes::<Test>(&invalid_bytes), Err(Error::Eof));
+
+    let invalid_uleb = vec![0x80, 0x80, 0x80, 0x80, 0x80];
+    // Error comes from uleb decoder because u32 are never that long.
+    assert_eq!(
+        from_bytes::<Test>(&invalid_uleb),
+        Err(Error::IntegerOverflowDuringUleb128Decoding)
+    );
+
+    let invalid_uleb = vec![0x80, 0x80, 0x80, 0x80, 0x1f];
+    // Error comes from uleb decoder because we are truncating a larger integer into u32.
+    assert_eq!(
+        from_bytes::<Test>(&invalid_uleb),
+        Err(Error::IntegerOverflowDuringUleb128Decoding)
+    );
+
+    let invalid_uleb = vec![0x80, 0x80, 0x80, 0x80, 0x0f];
+    // Error comes from Serde because ULEB integer is valid.
+    assert_eq!(
+        from_bytes::<Test>(&invalid_uleb),
+        Err(Error::Custom(
+            "invalid value: integer `4026531840`, expected variant index 0 <= i < 2".into()
+        ))
+    );
+
+    let invalid_uleb = vec![0x80, 0x80, 0x80, 0x00];
+    // Uleb decoder must reject non-canonical forms.
+    assert_eq!(
+        from_bytes::<Test>(&invalid_uleb),
+        Err(Error::NonCanonicalUleb128Encoding)
+    );
 }
 
 #[test]
@@ -282,14 +352,62 @@ fn sequence_too_long() {
 }
 
 #[test]
+fn variable_lengths() {
+    assert_eq!(to_bytes(&vec![(); 1]).unwrap(), vec![0x01]);
+    assert_eq!(to_bytes(&vec![(); 128]).unwrap(), vec![0x80, 0x01]);
+    assert_eq!(to_bytes(&vec![(); 255]).unwrap(), vec![0xff, 0x01]);
+    assert_eq!(
+        to_bytes(&vec![(); 786_432]).unwrap(),
+        vec![0x80, 0x80, 0x30]
+    );
+}
+
+#[test]
 fn sequence_not_long_enough() {
-    let seq = vec![5, 0, 0, 0, 1, 2, 3, 4]; // Missing 5th element
+    let seq = vec![5, 1, 2, 3, 4]; // Missing 5th element
     assert_eq!(from_bytes::<Vec<u8>>(&seq), Err(Error::Eof));
 }
 
 #[test]
+fn map_not_canonical() {
+    let mut map = BTreeMap::new();
+    map.insert(4u8, ());
+    map.insert(5u8, ());
+    let seq = vec![2, 4, 5];
+    assert_eq!(from_bytes::<BTreeMap<u8, ()>>(&seq), Ok(map));
+    // Make sure out-of-order keys are rejected.
+    let seq = vec![2, 5, 4];
+    assert_eq!(
+        from_bytes::<BTreeMap<u8, ()>>(&seq),
+        Err(Error::NonCanonicalMap)
+    );
+    // Make sure duplicate keys are rejected.
+    let seq = vec![2, 5, 5];
+    assert_eq!(
+        from_bytes::<BTreeMap<u8, ()>>(&seq),
+        Err(Error::NonCanonicalMap)
+    );
+}
+
+#[test]
+fn by_default_btreesets_are_serialized_as_sequences() {
+    // See https://docs.serde.rs/src/serde/de/impls.rs.html
+    // This is a big caveat for us, but luckily, generate-format will track this in the YAML output.
+    let mut set = BTreeSet::new();
+    set.insert(4u8);
+    set.insert(5u8);
+    let seq = vec![2, 4, 5];
+    assert_eq!(from_bytes::<BTreeSet<u8>>(&seq), Ok(set.clone()));
+    let seq = vec![2, 5, 4];
+    assert_eq!(from_bytes::<BTreeSet<u8>>(&seq), Ok(set.clone()));
+    // Duplicate keys are just ok.
+    let seq = vec![3, 5, 5, 4];
+    assert_eq!(from_bytes::<BTreeSet<u8>>(&seq), Ok(set));
+}
+
+#[test]
 fn leftover_bytes() {
-    let seq = vec![5, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]; // 5 extra elements
+    let seq = vec![5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]; // 5 extra elements
     assert_eq!(from_bytes::<Vec<u8>>(&seq), Err(Error::RemainingInput));
 }
 
@@ -321,7 +439,7 @@ fn zero_copy_parse() {
         borrowed_bytes: &[0, 1, 2, 3],
     };
     {
-        let expected = vec![2, 0, 0, 0, b'h', b'i', 4, 0, 0, 0, 0, 1, 2, 3];
+        let expected = vec![2, b'h', b'i', 4, 0, 1, 2, 3];
         let encoded = to_bytes(&f).unwrap();
         assert_eq!(expected, encoded);
         let out: Foo = from_bytes(&encoded[..]).unwrap();
@@ -447,15 +565,13 @@ fn serde_known_vector() {
     let bytes = to_bytes(&f).unwrap();
 
     let test_vector = vec![
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x06, 0x00, 0x00, 0x00, 0x64, 0x63, 0x58,
-        0x4d, 0x42, 0x37, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00,
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x06, 0x64, 0x63, 0x58, 0x4d, 0x42, 0x37,
+        0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
+        0x06, 0x07, 0x08, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05,
         0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05,
-        0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x63, 0x00, 0x00, 0x00,
-        0x01, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x03, 0x00, 0x00, 0x00, 0x16,
-        0x15, 0x43, 0x03, 0x00, 0x00, 0x00, 0x00, 0x38, 0x15, 0x03, 0x00, 0x00, 0x00, 0x16, 0x0a,
-        0x05, 0x04, 0x00, 0x00, 0x00, 0x14, 0x15, 0x59, 0x69, 0x03, 0x00, 0x00, 0x00, 0xc9, 0x17,
-        0x5a,
+        0x05, 0x05, 0x05, 0x05, 0x05, 0x63, 0x00, 0x00, 0x00, 0x01, 0x03, 0x01, 0x01, 0x03, 0x16,
+        0x15, 0x43, 0x03, 0x00, 0x38, 0x15, 0x03, 0x16, 0x0a, 0x05, 0x04, 0x14, 0x15, 0x59, 0x69,
+        0x03, 0xc9, 0x17, 0x5a,
     ];
 
     // make sure we serialize into exact same bytes as before
@@ -464,4 +580,170 @@ fn serde_known_vector() {
     // make sure we can deserialize the test vector into expected struct
     let deserialized_foo: Foo = from_bytes(&test_vector).unwrap();
     assert_eq!(f, deserialized_foo);
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Clone)]
+struct List {
+    next: Option<(usize, Box<List>)>,
+}
+
+impl List {
+    fn empty() -> Self {
+        Self { next: None }
+    }
+
+    fn cons(value: usize, tail: List) -> Self {
+        Self {
+            next: Some((value, Box::new(tail))),
+        }
+    }
+
+    fn integers(len: usize) -> Self {
+        if len == 0 {
+            Self::empty()
+        } else {
+            Self::cons(len - 1, Self::integers(len - 1))
+        }
+    }
+}
+
+#[test]
+fn test_recursion_limit() {
+    let l1 = List::integers(4);
+    let b1 = to_bytes(&l1).unwrap();
+    assert_eq!(
+        b1,
+        vec![
+            1, 3, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        ]
+    );
+    assert_eq!(from_bytes::<List>(&b1).unwrap(), l1);
+
+    let l2 = List::integers(MAX_CONTAINER_DEPTH - 1);
+    let b2 = to_bytes(&l2).unwrap();
+    assert_eq!(from_bytes::<List>(&b2).unwrap(), l2);
+
+    let l3 = List::integers(MAX_CONTAINER_DEPTH);
+    assert_eq!(
+        to_bytes(&l3),
+        Err(Error::ExceededContainerDepthLimit("List"))
+    );
+    let mut b3 = vec![1, 243, 1, 0, 0, 0, 0, 0, 0];
+    b3.extend(b2);
+    assert_eq!(
+        from_bytes::<List>(&b3),
+        Err(Error::ExceededContainerDepthLimit("List"))
+    );
+
+    let b2_pair = to_bytes(&(&l2, &l2)).unwrap();
+    assert_eq!(
+        from_bytes::<(List, List)>(&b2_pair).unwrap(),
+        (l2.clone(), l2.clone())
+    );
+    assert_eq!(
+        to_bytes(&(&l2, &l3)),
+        Err(Error::ExceededContainerDepthLimit("List"))
+    );
+    assert_eq!(
+        to_bytes(&(&l3, &l2)),
+        Err(Error::ExceededContainerDepthLimit("List"))
+    );
+    assert_eq!(
+        to_bytes(&(&l3, &l3)),
+        Err(Error::ExceededContainerDepthLimit("List"))
+    );
+}
+
+#[test]
+fn ed25519_material() {
+    use std::borrow::Cow;
+
+    let private_key =
+        Ed25519PrivateKey::try_from([1u8; ED25519_PRIVATE_KEY_LENGTH].as_ref()).unwrap();
+    let public_key = Ed25519PublicKey::from(&private_key);
+
+    let serialized_public_key = to_bytes(&Cow::Borrowed(&public_key)).unwrap();
+    // Expected size should be 1 byte due to LCS length prefix + 32 bytes for the raw key bytes
+    assert_eq!(serialized_public_key.len(), 1 + ED25519_PUBLIC_KEY_LENGTH);
+
+    // Ensure public key serialization - deserialization is stable and deterministic
+    let deserialized_public_key: Ed25519PublicKey = from_bytes(&serialized_public_key).unwrap();
+    assert_eq!(deserialized_public_key, public_key);
+
+    let message = TestLibraCrypto("Hello, World".to_string());
+    let signature: Ed25519Signature = private_key.sign(&message);
+
+    let serialized_signature = to_bytes(&Cow::Borrowed(&signature)).unwrap();
+    // Expected size should be 1 byte due to LCS length prefix + 64 bytes for the raw signature bytes
+    assert_eq!(serialized_signature.len(), 1 + ED25519_SIGNATURE_LENGTH);
+
+    // Ensure signature serialization - deserialization is stable and deterministic
+    let deserialized_signature: Ed25519Signature = from_bytes(&serialized_signature).unwrap();
+    assert_eq!(deserialized_signature, signature);
+
+    // Verify signature
+    let verified_signature = signature.verify(&message, &public_key);
+    assert!(verified_signature.is_ok())
+}
+
+#[test]
+fn multi_ed25519_material() {
+    use std::borrow::Cow;
+
+    // Helper function to generate N ed25519 private keys.
+    fn generate_keys(n: usize) -> Vec<Ed25519PrivateKey> {
+        let mut rng = StdRng::from_seed(TEST_SEED);
+        (0..n)
+            .map(|_| Ed25519PrivateKey::generate(&mut rng))
+            .collect()
+    }
+
+    let num_of_keys = 10;
+    let threshold = 7;
+    let private_keys_10 = generate_keys(num_of_keys);
+    let multi_private_key_7of10 = MultiEd25519PrivateKey::new(private_keys_10, threshold).unwrap();
+    let multi_public_key_7of10 = MultiEd25519PublicKey::from(&multi_private_key_7of10);
+
+    let serialized_multi_public_key = to_bytes(&Cow::Borrowed(&multi_public_key_7of10)).unwrap();
+
+    // Expected size due to specialization is
+    // 2 bytes for LCS length prefix (due to ULEB128)
+    // + 10 * single_pub_key_size bytes (each key is the compressed Edwards Y coordinate)
+    // + 1 byte for the threshold
+    assert_eq!(
+        serialized_multi_public_key.len(),
+        2 + num_of_keys * ED25519_PUBLIC_KEY_LENGTH + 1
+    );
+
+    let deserialized_multi_public_key: MultiEd25519PublicKey =
+        from_bytes(&serialized_multi_public_key).unwrap();
+    assert_eq!(deserialized_multi_public_key, multi_public_key_7of10);
+
+    let message = TestLibraCrypto("Hello, World".to_string());
+
+    // Verifying a 7-of-10 signature against a public key with the same threshold should pass.
+    let multi_signature_7of10: MultiEd25519Signature = multi_private_key_7of10.sign(&message);
+
+    let serialized_multi_signature = to_bytes(&Cow::Borrowed(&multi_signature_7of10)).unwrap();
+    // Expected size due to specialization is
+    // 2 bytes for LCS length prefix (due to ULEB128)
+    // + 7 * single_signature_size bytes (each sig is of the form (R,s),
+    // a 32B compressed Edwards Y coordinate concatenated with a 32B scalar)
+    // + 4 bytes for the bitmap (the bitmap can hold up to 32 bits)
+    assert_eq!(
+        serialized_multi_signature.len(),
+        2 + threshold as usize * ED25519_SIGNATURE_LENGTH + 4
+    );
+
+    // Verify bitmap
+    assert_eq!(
+        multi_signature_7of10.bitmap(),
+        &[0b1111_1110, 0u8, 0u8, 0u8]
+    );
+
+    // Verify signature
+    assert!(multi_signature_7of10
+        .verify(&message, &multi_public_key_7of10)
+        .is_ok());
 }

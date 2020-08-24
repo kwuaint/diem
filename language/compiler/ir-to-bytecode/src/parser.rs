@@ -1,18 +1,19 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use codespan::{ByteIndex, CodeMap, Span};
-use codespan_reporting::{emit, termcolor::Buffer, Diagnostic, Label, Severity};
-use failure::*;
+use anyhow::{bail, Result};
+use codespan::Files;
+use codespan_reporting::{
+    diagnostic::{Diagnostic, Label},
+    term::{
+        emit,
+        termcolor::{ColorChoice, StandardStream},
+        Config,
+    },
+};
 use ir_to_bytecode_syntax::syntax::{self, ParseError};
 use libra_types::account_address::AccountAddress;
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-};
-
-// Re-export this to make it convenient for other crates.
-pub use ir_to_bytecode_syntax::ast;
+use move_ir_types::{ast, location::*};
 
 /// Determine if a character is an allowed eye-visible (printable) character.
 ///
@@ -83,88 +84,63 @@ fn strip_comments_and_verify(string: &str) -> Result<String> {
 
 /// Given the raw input of a file, creates a `ScriptOrModule` enum
 /// Fails with `Err(_)` if the text cannot be parsed`
-pub fn parse_script_or_module(s: &str) -> Result<ast::ScriptOrModule> {
+pub fn parse_script_or_module(file_name: &str, s: &str) -> Result<ast::ScriptOrModule> {
     let stripped_string = &strip_comments_and_verify(s)?;
-    syntax::parse_script_or_module_string(stripped_string).or_else(|e| handle_error(e, s))
-}
-
-/// Given the raw input of a file, creates a `Program` struct
-/// Fails with `Err(_)` if the text cannot be parsed
-pub fn parse_program(program_str: &str) -> Result<ast::Program> {
-    let stripped_string = &strip_comments_and_verify(program_str)?;
-    syntax::parse_program_string(stripped_string).or_else(|e| handle_error(e, stripped_string))
+    syntax::parse_script_or_module_string(file_name, stripped_string)
+        .or_else(|e| handle_error(e, s))
 }
 
 /// Given the raw input of a file, creates a `Script` struct
 /// Fails with `Err(_)` if the text cannot be parsed
-pub fn parse_script(script_str: &str) -> Result<ast::Script> {
+pub fn parse_script(file_name: &str, script_str: &str) -> Result<ast::Script> {
     let stripped_string = &strip_comments_and_verify(script_str)?;
-    syntax::parse_script_string(stripped_string).or_else(|e| handle_error(e, stripped_string))
+    syntax::parse_script_string(file_name, stripped_string)
+        .or_else(|e| handle_error(e, stripped_string))
 }
 
 /// Given the raw input of a file, creates a single `ModuleDefinition` struct
 /// Fails with `Err(_)` if the text cannot be parsed
-pub fn parse_module(modules_str: &str) -> Result<ast::ModuleDefinition> {
+pub fn parse_module(file_name: &str, modules_str: &str) -> Result<ast::ModuleDefinition> {
     let stripped_string = &strip_comments_and_verify(modules_str)?;
-    syntax::parse_module_string(stripped_string).or_else(|e| handle_error(e, stripped_string))
+    syntax::parse_module_string(file_name, stripped_string)
+        .or_else(|e| handle_error(e, stripped_string))
 }
 
-/// Given the raw input of a file, creates a single `Cmd` struct
+/// Given the raw input of a file, creates a single `Cmd_` struct
 /// Fails with `Err(_)` if the text cannot be parsed
-pub fn parse_cmd(cmd_str: &str, _sender_address: AccountAddress) -> Result<ast::Cmd> {
+pub fn parse_cmd_(
+    file_name: &str,
+    cmd_str: &str,
+    _sender_address: AccountAddress,
+) -> Result<ast::Cmd_> {
     let stripped_string = &strip_comments_and_verify(cmd_str)?;
-    syntax::parse_cmd_string(stripped_string).or_else(|e| handle_error(e, stripped_string))
+    syntax::parse_cmd_string(file_name, stripped_string)
+        .or_else(|e| handle_error(e, stripped_string))
 }
 
-fn handle_error<'input, T, Token>(
-    e: syntax::ParseError<usize, Token, failure::Error>,
-    code_str: &'input str,
-) -> Result<T>
-where
-    Token: std::fmt::Display,
-{
-    let mut s = DefaultHasher::new();
-    code_str.hash(&mut s);
-    let mut code = CodeMap::new();
-    code.add_filemap(s.finish().to_string().into(), code_str.to_string());
+fn handle_error<T>(e: syntax::ParseError<Loc, anyhow::Error>, code_str: &str) -> Result<T> {
     let msg = match &e {
         ParseError::InvalidToken { location } => {
-            let error =
-                Diagnostic::new(Severity::Error, "Invalid Token").with_label(Label::new_primary(
-                    Span::new(ByteIndex(*location as u32), ByteIndex(*location as u32)),
-                ));
-            let mut buffer = Buffer::no_color();
-            emit(&mut buffer, &code, &error).unwrap();
-            std::str::from_utf8(buffer.as_slice()).unwrap().to_string()
+            let mut files = Files::new();
+            let id = files.add(location.file(), code_str.to_string());
+            let lbl = Label::new(id, location.span(), "Invalid Token");
+            let error = Diagnostic::new_error("Parser Error", lbl);
+            let writer = &mut StandardStream::stderr(ColorChoice::Auto);
+            emit(writer, &Config::default(), &files, &error).unwrap();
+            "Invalid Token".to_string()
         }
-        ParseError::UnrecognizedToken {
-            token: (l, tok, r),
-            expected,
-        } => {
-            let error = Diagnostic::new(Severity::Error, format!("Unrecognized Token: {}", tok))
-                .with_label(
-                    Label::new_primary(Span::new(ByteIndex(*l as u32), ByteIndex(*r as u32)))
-                        .with_message(format!(
-                            "Expected: {}",
-                            expected
-                                .iter()
-                                .fold(String::new(), |acc, token| format!("{} {},", acc, token))
-                        )),
-                );
-            let mut buffer = Buffer::no_color();
-            emit(&mut buffer, &code, &error).unwrap();
-            std::str::from_utf8(buffer.as_slice()).unwrap().to_string()
+        ParseError::User { error } => {
+            println!("{}", error);
+            format!("{}", error)
         }
-        _ => format!("{}", e),
     };
-    println!("{}", msg);
-    bail!("ParserError: {}", e)
+    bail!("ParserError: {}", msg)
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn verify_character_whitelist() {
+    fn verify_character_allowlist() {
         let mut good_chars = (0x20..=0x7E).collect::<Vec<u8>>();
         good_chars.push(0x0A);
         good_chars.push(0x09);
@@ -173,14 +149,14 @@ mod tests {
         bad_chars.append(&mut (0x0B..=0x1F).collect::<Vec<_>>());
         bad_chars.push(0x7F);
 
-        // Test to make sure that all the characters that are in the whitelist pass.
+        // Test to make sure that all the characters that are in the allowlist pass.
         {
             let s = std::str::from_utf8(&good_chars)
                 .expect("Failed to construct string containing an invalid character. This shouldn't happen.");
             assert!(super::verify_string(s).is_ok());
         }
 
-        // Test to make sure that we fail for all characters not in the whitelist.
+        // Test to make sure that we fail for all characters not in the allowlist.
         for bad_char in bad_chars {
             good_chars.push(bad_char);
             let s = std::str::from_utf8(&good_chars)

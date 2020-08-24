@@ -1,13 +1,14 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{block::Block, common::Payload};
-use failure::prelude::*;
+use crate::block::Block;
+use anyhow::ensure;
 use libra_crypto::hash::HashValue;
-use libra_types::crypto_proxies::ValidatorVerifier;
+use libra_types::validator_verifier::ValidatorVerifier;
 use serde::{Deserialize, Serialize};
-use std::convert::TryFrom;
 use std::fmt;
+
+pub const MAX_BLOCKS_PER_REQUEST: u64 = 10;
 
 /// RPC to get a chain of block of the given length starting from the given block id.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -41,24 +42,6 @@ impl fmt::Display for BlockRetrievalRequest {
     }
 }
 
-impl TryFrom<network::proto::RequestBlock> for BlockRetrievalRequest {
-    type Error = failure::Error;
-
-    fn try_from(proto: network::proto::RequestBlock) -> failure::Result<Self> {
-        Ok(lcs::from_bytes(&proto.bytes)?)
-    }
-}
-
-impl TryFrom<BlockRetrievalRequest> for network::proto::RequestBlock {
-    type Error = failure::Error;
-
-    fn try_from(block_retrieval_request: BlockRetrievalRequest) -> failure::Result<Self> {
-        Ok(Self {
-            bytes: lcs::to_bytes(&block_retrieval_request)?,
-        })
-    }
-}
-
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum BlockRetrievalStatus {
     // Successfully fill in the request.
@@ -71,14 +54,13 @@ pub enum BlockRetrievalStatus {
 
 /// Carries the returned blocks and the retrieval status.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct BlockRetrievalResponse<T> {
+pub struct BlockRetrievalResponse {
     status: BlockRetrievalStatus,
-    #[serde(bound(deserialize = "Block<T>: Deserialize<'de>"))]
-    blocks: Vec<Block<T>>,
+    blocks: Vec<Block>,
 }
 
-impl<T: Payload> BlockRetrievalResponse<T> {
-    pub fn new(status: BlockRetrievalStatus, blocks: Vec<Block<T>>) -> Self {
+impl BlockRetrievalResponse {
+    pub fn new(status: BlockRetrievalStatus, blocks: Vec<Block>) -> Self {
         Self { status, blocks }
     }
 
@@ -86,7 +68,7 @@ impl<T: Payload> BlockRetrievalResponse<T> {
         self.status.clone()
     }
 
-    pub fn blocks(&self) -> &Vec<Block<T>> {
+    pub fn blocks(&self) -> &Vec<Block> {
         &self.blocks
     }
 
@@ -95,7 +77,7 @@ impl<T: Payload> BlockRetrievalResponse<T> {
         block_id: HashValue,
         num_blocks: u64,
         sig_verifier: &ValidatorVerifier,
-    ) -> failure::Result<()> {
+    ) -> anyhow::Result<()> {
         ensure!(
             self.status != BlockRetrievalStatus::Succeeded
                 || self.blocks.len() as u64 == num_blocks,
@@ -106,7 +88,7 @@ impl<T: Payload> BlockRetrievalResponse<T> {
         self.blocks
             .iter()
             .try_fold(block_id, |expected_id, block| {
-                block.validate_signatures(sig_verifier)?;
+                block.validate_signature(sig_verifier)?;
                 block.verify_well_formed()?;
                 ensure!(
                     block.id() == expected_id,
@@ -120,7 +102,7 @@ impl<T: Payload> BlockRetrievalResponse<T> {
     }
 }
 
-impl<T: Payload> fmt::Display for BlockRetrievalResponse<T> {
+impl fmt::Display for BlockRetrievalResponse {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.status() {
             BlockRetrievalStatus::Succeeded => {
@@ -139,23 +121,5 @@ impl<T: Payload> fmt::Display for BlockRetrievalResponse<T> {
             }
             _ => write!(f, "[BlockRetrievalResponse: status: {:?}", self.status()),
         }
-    }
-}
-
-impl<T: Payload> TryFrom<network::proto::RespondBlock> for BlockRetrievalResponse<T> {
-    type Error = failure::Error;
-
-    fn try_from(proto: network::proto::RespondBlock) -> failure::Result<Self> {
-        Ok(lcs::from_bytes(&proto.bytes)?)
-    }
-}
-
-impl<T: Payload> TryFrom<BlockRetrievalResponse<T>> for network::proto::RespondBlock {
-    type Error = failure::Error;
-
-    fn try_from(block_retrieval_response: BlockRetrievalResponse<T>) -> failure::Result<Self> {
-        Ok(Self {
-            bytes: lcs::to_bytes(&block_retrieval_response)?,
-        })
     }
 }

@@ -1,35 +1,293 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
+#[cfg(feature = "vanilla")]
+use vanilla_curve25519_dalek as curve25519_dalek;
+#[cfg(feature = "vanilla")]
+use vanilla_ed25519_dalek as ed25519_dalek;
 
+use crate as libra_crypto;
 use crate::{
-    ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature},
+    ed25519::{
+        Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature, ED25519_PRIVATE_KEY_LENGTH,
+        ED25519_PUBLIC_KEY_LENGTH, ED25519_SIGNATURE_LENGTH,
+    },
+    test_utils::{random_serializable_struct, uniform_keypair_strategy},
     traits::*,
-    unit_tests::uniform_keypair_strategy,
+    x25519,
 };
 
 use core::{
     convert::TryFrom,
-    ops::{Index, IndexMut},
+    ops::{Add, Index, IndexMut, Mul, Neg},
 };
+use ed25519_dalek::ed25519::signature::{Signature as _, Verifier as _};
 
-use crate::hash::HashValue;
-use ed25519_dalek;
-use proptest::prelude::*;
+use digest::Digest;
+use libra_crypto_derive::{CryptoHasher, LCSCryptoHash};
+use proptest::{collection::vec, prelude::*};
+use serde::{Deserialize, Serialize};
+use sha2::Sha512;
+
+#[derive(CryptoHasher, LCSCryptoHash, Serialize, Deserialize)]
+struct CryptoHashable(pub usize);
+
+// Takes a point in eight_torsion and finds its order
+fn eight_torsion_order(ep: curve25519_dalek::edwards::EdwardsPoint) -> usize {
+    let mut pt = ep;
+    let mut ord = 1;
+    for _i in 0..8 {
+        if pt == curve25519_dalek::edwards::EdwardsPoint::default() {
+            break;
+        } else {
+            pt = pt.add(ep);
+            ord += 1;
+        }
+    }
+    ord
+}
 
 proptest! {
+    #[test]
+    fn verify_canonicity_torsion(scalar in any::<[u8;32]>(), idx in 0usize..8usize){
+        let s = curve25519_dalek::scalar::Scalar::from_bytes_mod_order(scalar);
+        let s_b = curve25519_dalek::constants::ED25519_BASEPOINT_POINT.mul(s);
+        let torsion_component = curve25519_dalek::edwards::CompressedEdwardsY(EIGHT_TORSION[idx]).decompress().unwrap();
+        let torsioned = s_b.add(torsion_component);
+        let torsioned_bytes = torsioned.compress().to_bytes();
+        let deserialized = curve25519_dalek::edwards::CompressedEdwardsY(torsioned_bytes).decompress().unwrap();
+        prop_assert_eq!(deserialized, torsioned);
+    }
+
+
+    #[test]
+    fn verify_mul_torsion(idx in 0usize..8usize){
+        let torsion_component = curve25519_dalek::edwards::CompressedEdwardsY(EIGHT_TORSION[idx]).decompress().unwrap();
+        let mut order_bytes = [0u8;32];
+        order_bytes[..8].copy_from_slice(&(eight_torsion_order(torsion_component)).to_le_bytes());
+        let torsion_order = curve25519_dalek::scalar::Scalar::from_bits(order_bytes);
+
+        prop_assert_eq!(torsion_component.mul(torsion_order), curve25519_dalek::edwards::EdwardsPoint::default());
+    }
+
+    // In this test we demonstrate a signature that's not message-bound by only
+    // modifying the public key and the R component, under a pathological yet
+    // admissible s < l value for the signature
+    #[test]
+    fn verify_sig_malleable_torsion(keypair in uniform_keypair_strategy::<Ed25519PrivateKey, Ed25519PublicKey>(), idx in 0usize..8usize){
+        let message = b"hello_world";
+        ///////////////////////////////////
+        // baseline signature components //
+        ///////////////////////////////////
+        let pub_key_bytes = keypair.public_key.to_bytes();
+        let priv_key_bytes = keypair.private_key.to_bytes();
+        let pub_key = ed25519_dalek::PublicKey::from_bytes(&pub_key_bytes).unwrap();
+        let secret_key = ed25519_dalek::SecretKey::from_bytes(&priv_key_bytes).unwrap();
+        let priv_key = ed25519_dalek::ExpandedSecretKey::from(&secret_key);
+        let signature = priv_key.sign(&message[..], &pub_key);
+        prop_assert!(pub_key.verify(&message[..], &signature).is_ok());
+
+        let torsion_component = curve25519_dalek::edwards::CompressedEdwardsY(EIGHT_TORSION[idx]).decompress().unwrap();
+
+        let mut r_bits = [0u8; 32];
+        r_bits.copy_from_slice(&signature.to_bytes()[..32]);
+
+        let r_point = curve25519_dalek::edwards::CompressedEdwardsY(r_bits).decompress().unwrap();
+        let mixed_r_point = r_point.add(torsion_component);
+        prop_assert_eq!(r_point.mul_by_cofactor(), mixed_r_point.mul_by_cofactor());
+
+        let pub_point = curve25519_dalek::edwards::CompressedEdwardsY(pub_key_bytes).decompress().unwrap();
+        let mixed_pub_point = pub_point.add(torsion_component);
+        prop_assert_eq!(pub_point.mul_by_cofactor(), mixed_pub_point.mul_by_cofactor());
+
+        //////////////////////////
+        // Compute k = H(R∥A∥m) //
+        //////////////////////////
+        let mut h: Sha512 = Sha512::default();
+        h.update(&mixed_r_point.compress().to_bytes());
+        h.update(&mixed_pub_point.compress().to_bytes());
+        h.update(&message);
+        // curve25519_dalek is stuck on an old digest version, so we can't do
+        // Scalar::from_hash
+        let mut output = [0u8; 64];
+        output.copy_from_slice(h.finalize().as_slice());
+        let k = curve25519_dalek::scalar::Scalar::from_bytes_mod_order_wide(&output);
+
+        //////////////////////////////////////////////////////////////
+        // obtain the original r s.t. R = r B, to solve for s later //
+        //////////////////////////////////////////////////////////////
+        let mut expanded_priv_key = [0u8; 64];
+        let mut h: Sha512 = Sha512::default();
+        h.update(priv_key_bytes);
+        expanded_priv_key.copy_from_slice(h.finalize().as_slice());
+
+        let nonce = &expanded_priv_key[32..];
+        let mut h: Sha512 = Sha512::default();
+        h.update(nonce);
+        h.update(&message);
+        // curve25519_dalek is stuck on an old digest version, so we can't do
+        // Scalar::from_hash
+        let mut output = [0u8; 64];
+        output.copy_from_slice(h.finalize().as_slice());
+        let original_r = curve25519_dalek::scalar::Scalar::from_bytes_mod_order_wide(&output);
+
+        // check r_point = original_r * basepoint
+        prop_assert_eq!(curve25519_dalek::constants::ED25519_BASEPOINT_POINT.mul(original_r), r_point);
+
+        //////////////////////////////////////////
+        // obtain the original a s.t. a * B = A //
+        //////////////////////////////////////////
+        let mut key_bytes = [0u8;32];
+        key_bytes.copy_from_slice(&expanded_priv_key[..32]);
+        key_bytes[0] &= 248;
+        key_bytes[31] &= 127;
+        key_bytes[31] |= 64;
+        let priv_scalar = curve25519_dalek::scalar::Scalar::from_bits(key_bytes);
+        // check pub_point = priv_scalar * basepoint
+        prop_assert_eq!(curve25519_dalek::constants::ED25519_BASEPOINT_POINT.mul(priv_scalar), pub_point);
+
+        //////////////////////////
+        // s = r + k a as usual //
+        //////////////////////////
+        let s = k * priv_scalar + original_r;
+        prop_assert!(s.is_canonical());
+
+        /////////////////////////////////////////////////////////////////////////////////
+        // Check the cofactored equation (modulo 8) before conversion to dalek formats //
+        /////////////////////////////////////////////////////////////////////////////////
+        let mut eight_scalar_bytes = [0u8;32];
+        eight_scalar_bytes[..8].copy_from_slice(&(8 as usize).to_le_bytes());
+        let eight_scalar = curve25519_dalek::scalar::Scalar::from_bits(eight_scalar_bytes);
+
+        let r_candidate_point = curve25519_dalek::edwards::EdwardsPoint::vartime_double_scalar_mul_basepoint(&k, &(mixed_pub_point.neg().mul_by_cofactor()), &(s * eight_scalar));
+        prop_assert_eq!(mixed_r_point.mul_by_cofactor(), r_candidate_point);
+
+        ///////////////////////////////////////////////////////////
+        // convert byte strings in dalek terms and do API checks //
+        ///////////////////////////////////////////////////////////
+        let mixed_pub_key = ed25519_dalek::PublicKey::from_bytes(&mixed_pub_point.compress().to_bytes()).unwrap();
+        // check we would not have caught this mixed order point on PublicKey deserialization
+        prop_assert!(Ed25519PublicKey::try_from(&mixed_pub_point.compress().to_bytes()[..]).is_ok());
+
+        let mixed_signature_bits : Vec<u8> = [mixed_r_point.compress().to_bytes(), s.to_bytes()].concat();
+        // this will error if we don't have 0 ≤ s < l
+        let mixed_signature = ed25519_dalek::Signature::from_bytes(&mixed_signature_bits).unwrap();
+
+        // Check, however, that dalek is doing the raw equation check sB = R + kA
+        let permissive_passes = mixed_pub_key.verify(&message[..], &mixed_signature).is_ok();
+        let strict_passes = mixed_pub_key.verify_strict(&message[..], &mixed_signature).is_ok();
+
+        let torsion_order = eight_torsion_order(torsion_component);
+        let torsion_components_cancel = torsion_component + k * torsion_component == curve25519_dalek::edwards::EdwardsPoint::default();
+
+        prop_assert!(!permissive_passes || (torsion_order == 1) || torsion_components_cancel,
+                     "bad verification_state permissive passes {} strict passes {} mixed_order {:?} torsion_components_cancel {:?}",
+                     permissive_passes,
+                     strict_passes,
+                     torsion_order,
+                     torsion_components_cancel
+        );
+    }
+
+    // In this test we demonstrate a signature that's transformable by only
+    // modifying the public key and the R component, under a pathological yet
+    // admissible s < l value for the signature. It shows the difference
+    // between `verify` and `verify_strict` in ed25519-dalek
+    #[test]
+    fn verify_sig_strict_torsion(idx in 0usize..8usize){
+        let message = b"hello_world";
+
+        // Dalek only performs an order check, so this is allowed
+        let bad_scalar = curve25519_dalek::scalar::Scalar::zero();
+
+        let bad_component_1 = curve25519_dalek::edwards::CompressedEdwardsY(EIGHT_TORSION[idx]).decompress().unwrap();
+        let bad_component_2 = bad_component_1.neg();
+
+        // compute bad_pub_key, bad_signature
+        let bad_pub_key_point = bad_component_1; // we need this to cancel the hashed component of the verification equation
+
+        // we pick an evil R component
+        let bad_sig_point = bad_component_2;
+
+        let bad_key = ed25519_dalek::PublicKey::from_bytes(&bad_pub_key_point.compress().to_bytes()).unwrap();
+        // We check that we would have caught this one on the public key
+        prop_assert!(Ed25519PublicKey::try_from(&bad_pub_key_point.compress().to_bytes()[..]).is_err());
+
+        let bad_signature = ed25519_dalek::Signature::from_bytes(&[
+            &bad_sig_point.compress().to_bytes()[..],
+            &bad_scalar.to_bytes()[..]
+        ].concat()).unwrap();
+
+        // Seek k = H(R, A, M) ≡ 1 [8]
+        prop_assume!(bad_key.verify(&message[..], &bad_signature).is_ok());
+        prop_assert!(bad_key.verify_strict(&message[..], &bad_signature).is_err());
+
+    }
+
+
+    #[test]
+    fn convert_from_ed25519_publickey(keypair in uniform_keypair_strategy::<Ed25519PrivateKey, Ed25519PublicKey>()) {
+        let x25519_public_key = x25519::PublicKey::from_ed25519_public_bytes(&keypair.public_key.to_bytes()[..]).unwrap();
+
+        // Let's construct an x25519 private key from the ed25519 private key.
+        let x25519_privatekey = x25519::PrivateKey::from_ed25519_private_bytes(&keypair.private_key.to_bytes()[..]);
+
+        // This is the important part! We abandon the entire test if an x25519 private
+        // key can't be built from this ed25519 private key, thus "grinding"
+        // the RNG.
+        if x25519_privatekey.is_ok() {
+            // Now derive the public key from x25519_privatekey and see if it matches the public key that
+            // was created from the Ed25519PublicKey.
+            let x25519_publickey_2 = x25519_privatekey.unwrap().public_key();
+            assert_eq!(x25519_public_key, x25519_publickey_2);
+        }
+    }
+
+    #[test]
+    fn ed25519_and_x25519_privkeys(keypair in uniform_keypair_strategy::<x25519::PrivateKey, x25519::PublicKey>()){
+        let x25519_public_bytes = keypair.public_key.to_bytes();
+        let x25519_private_bytes = keypair.private_key.to_bytes();
+        //sanity-check
+        prop_assert_eq!(x25519_public_bytes.clone(), x25519::PublicKey::from(&keypair.private_key).to_bytes());
+
+        // always pass false if you hope to ever get back to the original public key
+        let ed25519_public = Ed25519PublicKey::from_x25519_public_bytes(&x25519_public_bytes, false).unwrap();
+        let x25519_backconverted_public = x25519::PublicKey::from_ed25519_public_bytes(&ed25519_public.to_bytes()[..]).unwrap();
+
+        let ed25519_private = Ed25519PrivateKey::try_from(&x25519_private_bytes[..]).unwrap();
+        let x25519_backconverted_private = x25519::PrivateKey::try_from(&ed25519_private.to_bytes()[..]).unwrap();
+
+        // Test that you can always retrieve a valid x25519 keypair after
+        // "serialization" as an ed25519 keypair
+        prop_assert_eq!(keypair.public_key, x25519_backconverted_public);
+        prop_assert_eq!(keypair.private_key, x25519_backconverted_private.clone());
+        prop_assert_eq!(x25519_backconverted_public, x25519::PublicKey::from(&x25519_backconverted_private));
+        // Note that the reverse is not true: converting to an x25519 private
+        // key mangles the ed25519 private key bits irreversibly !
+    }
+
+    #[test]
+    fn ed25519_to_x25519_roundtrip(keypair in uniform_keypair_strategy::<Ed25519PrivateKey, Ed25519PublicKey>()){
+        let ed25519_bytes = keypair.public_key.to_bytes();
+        let x25519 = x25519::PublicKey::from_ed25519_public_bytes(&ed25519_bytes).unwrap();
+        let x25519_bytes = x25519.as_slice();
+        let backconverted_ed_positive = Ed25519PublicKey::from_x25519_public_bytes(x25519_bytes, false).unwrap();
+        let backconverted_ed_negative = Ed25519PublicKey::from_x25519_public_bytes(x25519_bytes, true).unwrap();
+        prop_assert!(keypair.public_key == backconverted_ed_negative || keypair.public_key == backconverted_ed_positive);
+    }
+
     #[test]
     fn test_keys_encode(keypair in uniform_keypair_strategy::<Ed25519PrivateKey, Ed25519PublicKey>()) {
         {
             let encoded = keypair.private_key.to_encoded_string().unwrap();
-             // Hex encoding of a 32-bytes key is 64 (2 x 32) characters.
-            prop_assert_eq!(2 * ed25519_dalek::SECRET_KEY_LENGTH, encoded.len());
+            // Hex encoding of a 32-bytes key is 64 (2 x 32) characters.
+            prop_assert_eq!(2 * ED25519_PRIVATE_KEY_LENGTH, encoded.len());
             let decoded = Ed25519PrivateKey::from_encoded_string(&encoded);
             prop_assert_eq!(Some(keypair.private_key), decoded.ok());
         }
         {
             let encoded = keypair.public_key.to_encoded_string().unwrap();
             // Hex encoding of a 32-bytes key is 64 (2 x 32) characters.
-            prop_assert_eq!(2 * ed25519_dalek::PUBLIC_KEY_LENGTH, encoded.len());
+            prop_assert_eq!(2 * ED25519_PUBLIC_KEY_LENGTH, encoded.len());
             let decoded = Ed25519PublicKey::from_encoded_string(&encoded);
             prop_assert_eq!(Some(keypair.public_key), decoded.ok());
         }
@@ -37,18 +295,19 @@ proptest! {
 
     #[test]
     fn test_batch_verify(
-        hash in any::<HashValue>(),
-        keypairs in proptest::array::uniform10(uniform_keypair_strategy::<Ed25519PrivateKey, Ed25519PublicKey>())) {
+        message in random_serializable_struct(),
+        keypairs in proptest::array::uniform10(uniform_keypair_strategy::<Ed25519PrivateKey, Ed25519PublicKey>())
+    ) {
         let mut signatures: Vec<(Ed25519PublicKey, Ed25519Signature)> = keypairs.iter().map(|keypair| {
-            (keypair.public_key.clone(), keypair.private_key.sign_message(&hash))
+            (keypair.public_key.clone(), keypair.private_key.sign(&message))
         }).collect();
-        prop_assert!(Ed25519Signature::batch_verify_signatures(&hash, signatures.clone()).is_ok());
+        prop_assert!(Ed25519Signature::batch_verify(&message, signatures.clone()).is_ok());
         // We swap message and signature for the last element,
         // resulting in an incorrect signature
         let (key, _sig) = signatures.pop().unwrap();
         let other_sig = signatures.last().unwrap().clone().1;
         signatures.push((key, other_sig));
-        prop_assert!(Ed25519Signature::batch_verify_signatures(&hash, signatures).is_err());
+        prop_assert!(Ed25519Signature::batch_verify(&message, signatures).is_err());
     }
 
     #[test]
@@ -57,13 +316,13 @@ proptest! {
     ) {
         {
             let serialized: &[u8] = &(keypair.private_key.to_bytes());
-            prop_assert_eq!(ed25519_dalek::SECRET_KEY_LENGTH, serialized.len());
+            prop_assert_eq!(ED25519_PRIVATE_KEY_LENGTH, serialized.len());
             let deserialized = Ed25519PrivateKey::try_from(serialized);
             prop_assert_eq!(Some(keypair.private_key), deserialized.ok());
         }
         {
             let serialized: &[u8] = &(keypair.public_key.to_bytes());
-            prop_assert_eq!(ed25519_dalek::PUBLIC_KEY_LENGTH, serialized.len());
+            prop_assert_eq!(ED25519_PUBLIC_KEY_LENGTH, serialized.len());
             let deserialized = Ed25519PublicKey::try_from(serialized);
             prop_assert_eq!(Some(keypair.public_key), deserialized.ok());
         }
@@ -71,23 +330,49 @@ proptest! {
 
     #[test]
     fn test_signature_verification_custom_serialisation(
-        hash in any::<HashValue>(),
+        message in random_serializable_struct(),
         keypair in uniform_keypair_strategy::<Ed25519PrivateKey, Ed25519PublicKey>()
     ) {
-        let signature = keypair.private_key.sign_message(&hash);
+        let signature = keypair.private_key.sign(&message);
         let serialized: &[u8] = &(signature.to_bytes());
-        prop_assert_eq!(ed25519_dalek::SIGNATURE_LENGTH, serialized.len());
+        prop_assert_eq!(ED25519_SIGNATURE_LENGTH, serialized.len());
         let deserialized = Ed25519Signature::try_from(serialized).unwrap();
-        prop_assert!(keypair.public_key.verify_signature(&hash, &deserialized).is_ok());
+        prop_assert!(deserialized.verify(&message, &keypair.public_key).is_ok());
+    }
+
+    #[test]
+    fn test_signature_verification_from_arbitrary(
+        // this should be > 64 bits to go over the length of a default hash
+        msg in vec(proptest::num::u8::ANY, 1..128),
+        keypair in uniform_keypair_strategy::<Ed25519PrivateKey, Ed25519PublicKey>()
+    ) {
+        let signature = keypair.private_key.sign_arbitrary_message(&msg);
+        let serialized: &[u8] = &(signature.to_bytes());
+        prop_assert_eq!(ED25519_SIGNATURE_LENGTH, serialized.len());
+        let deserialized = Ed25519Signature::try_from(serialized).unwrap();
+        prop_assert!(deserialized.verify_arbitrary_msg(&msg, &keypair.public_key).is_ok());
+    }
+
+    #[test]
+    fn test_signature_verification_from_struct(
+        x in any::<usize>(),
+        keypair in uniform_keypair_strategy::<Ed25519PrivateKey, Ed25519PublicKey>()
+    ) {
+        let hashable = CryptoHashable(x);
+        let signature = keypair.private_key.sign(&hashable);
+        let serialized: &[u8] = &(signature.to_bytes());
+        prop_assert_eq!(ED25519_SIGNATURE_LENGTH, serialized.len());
+        let deserialized = Ed25519Signature::try_from(serialized).unwrap();
+        prop_assert!(deserialized.verify(&hashable, &keypair.public_key).is_ok());
     }
 
     // Check for canonical S.
     #[test]
     fn test_signature_malleability(
-        hash in any::<HashValue>(),
+        message in random_serializable_struct(),
         keypair in uniform_keypair_strategy::<Ed25519PrivateKey, Ed25519PublicKey>()
     ) {
-        let signature = keypair.private_key.sign_message(&hash);
+        let signature = keypair.private_key.sign(&message);
         let mut serialized = signature.to_bytes();
 
         let mut r_bytes: [u8; 32] = [0u8; 32];
@@ -107,17 +392,16 @@ proptest! {
 
         // Check that malleable signatures will pass verification and deserialization in dalek.
         // Construct the corresponding dalek public key.
-        let dalek_public_key = ed25519_dalek::PublicKey::from_bytes(
+        let _dalek_public_key = ed25519_dalek::PublicKey::from_bytes(
             &keypair.public_key.to_bytes()
         ).unwrap();
 
         // Construct the corresponding dalek Signature. This signature is malleable.
         let dalek_sig = ed25519_dalek::Signature::from_bytes(&serialized);
 
-        // ed25519_dalek will deserialize the malleable signature. It does NOT detect it.
+        // ed25519_dalek will (post 2.0) deserialize the malleable
+        // signature. It does not detect it.
         prop_assert!(dalek_sig.is_ok());
-        // ed25519_dalek will verify malleable signatures as valid.
-        prop_assert!(dalek_public_key.verify(hash.as_ref(), &dalek_sig.unwrap()).is_ok());
 
         let serialized_malleable: &[u8] = &serialized;
         // try_from will fail on malleable signatures. We detect malleable signatures
@@ -127,14 +411,11 @@ proptest! {
             Err(CryptoMaterialError::CanonicalRepresentationError)
         );
 
-        // We expect from_bytes_unchecked deserialization not to fail, as we don't check
-        // for signature malleability. This method is pub(crate) and only used for test purposes.
-        let sig_unchecked = Ed25519Signature::from_bytes_unchecked(&serialized).unwrap();
-
-        // Malleable signatures will fail to verify in our implementation, even if for some reason
-        // we receive one. Note that this is a second step of validation as we typically check
-        // malleable signatures during deserialization.
-        prop_assert!(keypair.public_key.verify_signature(&hash, &sig_unchecked).is_err());
+        // We expect from_bytes_unchecked deserialization to succeed, as dalek
+        // does not check for signature malleability. This method is pub(crate)
+        // and only used for test purposes.
+        let sig_unchecked = Ed25519Signature::from_bytes_unchecked(&serialized);
+        prop_assert!(sig_unchecked.is_ok());
 
         // Update the signature by setting S = L to make it invalid.
         serialized[32..].copy_from_slice(&L.to_bytes());
@@ -233,7 +514,7 @@ impl Scalar52 {
         let mut words = [0u64; 4];
         for i in 0..4 {
             for j in 0..8 {
-                words[i] |= u64::from(bytes[(i * 8) + j]) << (j * 8);
+                words[i] |= u64::from(bytes[(i * 8) + j]) << (j * 8) as u64;
             }
         }
 

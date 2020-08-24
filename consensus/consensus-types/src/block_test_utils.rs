@@ -2,20 +2,30 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    block::Block, block_data::BlockData, block_info::BlockInfo, common::Round,
-    quorum_cert::QuorumCert, vote_data::VoteData,
+    block::Block,
+    block_data::BlockData,
+    common::{Payload, Round},
+    quorum_cert::QuorumCert,
+    vote_data::VoteData,
 };
-use libra_crypto::hash::{CryptoHash, HashValue};
+use libra_crypto::{
+    ed25519::Ed25519PrivateKey,
+    hash::{CryptoHash, HashValue},
+};
 use libra_types::{
-    crypto_proxies::{SecretKey, ValidatorSigner},
+    account_address::AccountAddress,
+    block_info::BlockInfo,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
-    validator_signer::proptests,
+    test_helpers::transaction_test_helpers::get_test_signed_txn,
+    validator_signer::{proptests, ValidatorSigner},
 };
 use proptest::prelude::*;
-use std::collections::BTreeMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-type LinearizedBlockForest<T> = Vec<Block<T>>;
+type LinearizedBlockForest = Vec<Block>;
 
 prop_compose! {
     /// This strategy is a swiss-army tool to produce a low-level block
@@ -29,12 +39,11 @@ prop_compose! {
         parent_qc: QuorumCert,
     )(
         round in round_strategy,
-        payload in 0usize..10usize,
         signer in signer_strategy,
         parent_qc in Just(parent_qc)
-    ) -> Block<Vec<usize>> {
+    ) -> Block {
         Block::new_proposal(
-            vec![payload],
+            vec![],
             round,
             get_current_timestamp().as_micros() as u64,
             parent_qc,
@@ -44,7 +53,7 @@ prop_compose! {
 }
 
 /// This produces the genesis block
-pub fn genesis_strategy() -> impl Strategy<Value = Block<Vec<usize>>> {
+pub fn genesis_strategy() -> impl Strategy<Value = Block> {
     Just(Block::make_genesis_block())
 }
 
@@ -57,24 +66,24 @@ prop_compose! {
             ancestor_id,
             Round::arbitrary(),
             proptests::arb_signer(),
-            QuorumCert::certificate_for_genesis(),
+            certificate_for_genesis(),
         )
-    ) -> Block<Vec<usize>> {
+    ) -> Block {
         block
     }
 }
 
 /// Offers the genesis block.
-pub fn leaf_strategy() -> impl Strategy<Value = Block<Vec<usize>>> {
+pub fn leaf_strategy() -> impl Strategy<Value = Block> {
     genesis_strategy().boxed()
 }
 
 prop_compose! {
     /// This produces a block with an invalid id (and therefore signature)
     /// given a valid block
-    pub fn fake_id(block_strategy: impl Strategy<Value = Block<Vec<usize>>>)
+    pub fn fake_id(block_strategy: impl Strategy<Value = Block>)
         (fake_id in HashValue::arbitrary(),
-         block in block_strategy) -> Block<Vec<usize>> {
+         block in block_strategy) -> Block {
             Block {
                 id: fake_id,
                 block_data: BlockData::new_proposal(
@@ -113,7 +122,7 @@ prop_compose! {
     /// QC to always be an ancestor or the parent to always be the highest QC
     fn child(
         signer_strategy: impl Strategy<Value = ValidatorSigner>,
-        block_forest_strategy: impl Strategy<Value = LinearizedBlockForest<Vec<usize>>>,
+        block_forest_strategy: impl Strategy<Value = LinearizedBlockForest>,
     )(
         signer in signer_strategy,
         (forest_vec, parent_idx, qc_idx) in block_forest_strategy
@@ -134,7 +143,7 @@ prop_compose! {
         // parent_qc
         forest_vec[qc_idx].quorum_cert().clone(),
     ), mut forest in Just(forest_vec),
-    ) -> LinearizedBlockForest<Vec<usize>> {
+    ) -> LinearizedBlockForest {
         forest.push(block);
         forest
     }
@@ -144,8 +153,8 @@ prop_compose! {
 /// vector
 fn block_forest_from_keys(
     depth: u32,
-    keypairs: Vec<SecretKey>,
-) -> impl Strategy<Value = LinearizedBlockForest<Vec<usize>>> {
+    keypairs: Vec<Ed25519PrivateKey>,
+) -> impl Strategy<Value = LinearizedBlockForest> {
     let leaf = leaf_strategy().prop_map(|block| vec![block]);
     // Note that having `expected_branch_size` of 1 seems to generate significantly larger trees
     // than desired (this is my understanding after reading the documentation:
@@ -159,7 +168,7 @@ fn block_forest_from_keys(
 pub fn block_forest_and_its_keys(
     quorum_size: usize,
     depth: u32,
-) -> impl Strategy<Value = (Vec<SecretKey>, LinearizedBlockForest<Vec<usize>>)> {
+) -> impl Strategy<Value = (Vec<Ed25519PrivateKey>, LinearizedBlockForest)> {
     proptest::collection::vec(proptests::arb_signing_key(), quorum_size).prop_flat_map(
         move |private_key| {
             (
@@ -179,14 +188,34 @@ pub fn get_current_timestamp() -> Duration {
 }
 
 pub fn placeholder_ledger_info() -> LedgerInfo {
-    LedgerInfo::new(
-        0,
-        HashValue::zero(),
-        HashValue::zero(),
-        HashValue::zero(),
-        0,
-        0,
-        None,
+    LedgerInfo::new(BlockInfo::empty(), HashValue::zero())
+}
+
+pub fn gen_test_certificate(
+    signers: Vec<&ValidatorSigner>,
+    block: BlockInfo,
+    parent_block: BlockInfo,
+    committed_block: Option<BlockInfo>,
+) -> QuorumCert {
+    let vote_data = VoteData::new(block, parent_block);
+    let ledger_info = match committed_block {
+        Some(info) => LedgerInfo::new(info, vote_data.hash()),
+        None => {
+            let mut placeholder = placeholder_ledger_info();
+            placeholder.set_consensus_data_hash(vote_data.hash());
+            placeholder
+        }
+    };
+
+    let mut signatures = BTreeMap::new();
+    for signer in signers {
+        let li_sig = signer.sign(&ledger_info);
+        signatures.insert(signer.author(), li_sig);
+    }
+
+    QuorumCert::new(
+        vote_data,
+        LedgerInfoWithSignatures::new(ledger_info, signatures),
     )
 }
 
@@ -196,45 +225,39 @@ pub fn placeholder_certificate_for_block(
     certified_block_round: u64,
     certified_parent_block_id: HashValue,
     certified_parent_block_round: u64,
-    consensus_block_id: Option<HashValue>,
 ) -> QuorumCert {
     // Assuming executed state to be Genesis state.
-    let genesis_ledger_info = LedgerInfo::genesis();
+    let genesis_ledger_info = LedgerInfo::mock_genesis(None);
     let vote_data = VoteData::new(
         BlockInfo::new(
-            genesis_ledger_info.epoch(),
+            genesis_ledger_info.epoch() + 1,
             certified_block_round,
             certified_block_id,
             genesis_ledger_info.transaction_accumulator_hash(),
             genesis_ledger_info.version(),
             genesis_ledger_info.timestamp_usecs(),
-            genesis_ledger_info.next_validator_set().cloned(),
+            None,
         ),
         BlockInfo::new(
-            genesis_ledger_info.epoch(),
+            genesis_ledger_info.epoch() + 1,
             certified_parent_block_round,
             certified_parent_block_id,
             genesis_ledger_info.transaction_accumulator_hash(),
             genesis_ledger_info.version(),
             genesis_ledger_info.timestamp_usecs(),
-            genesis_ledger_info.next_validator_set().cloned(),
+            None,
         ),
     );
 
     // This ledger info doesn't carry any meaningful information: it is all zeros except for
     // the consensus data hash that carries the actual vote.
     let mut ledger_info_placeholder = placeholder_ledger_info();
-    ledger_info_placeholder.set_consensus_data_hash(vote_data.hash());
 
-    if let Some(bid) = consensus_block_id {
-        ledger_info_placeholder.set_consensus_block_id(bid)
-    }
+    ledger_info_placeholder.set_consensus_data_hash(vote_data.hash());
 
     let mut signatures = BTreeMap::new();
     for signer in signers {
-        let li_sig = signer
-            .sign_message(ledger_info_placeholder.hash())
-            .expect("Failed to sign LedgerInfo");
+        let li_sig = signer.sign(&ledger_info_placeholder);
         signatures.insert(signer.author(), li_sig);
     }
 
@@ -242,4 +265,28 @@ pub fn placeholder_certificate_for_block(
         vote_data,
         LedgerInfoWithSignatures::new(ledger_info_placeholder, signatures),
     )
+}
+
+pub fn certificate_for_genesis() -> QuorumCert {
+    let ledger_info = LedgerInfo::mock_genesis(None);
+    QuorumCert::certificate_for_genesis_from_ledger_info(
+        &ledger_info,
+        Block::make_genesis_block_from_ledger_info(&ledger_info).id(),
+    )
+}
+
+pub fn random_payload(count: usize) -> Payload {
+    let address = AccountAddress::random();
+    let signer = ValidatorSigner::random(None);
+    (0..count)
+        .map(|i| {
+            get_test_signed_txn(
+                address,
+                i as u64,
+                signer.private_key(),
+                signer.public_key(),
+                None,
+            )
+        })
+        .collect()
 }

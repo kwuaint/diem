@@ -2,109 +2,85 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use grpcio::EnvBuilder;
 use itertools::zip_eq;
-use libra_config::config::NodeConfigHelpers;
-use libra_types::get_with_proof::{RequestItem, ResponseItem};
-use libradb::mock_genesis::db_with_mock_genesis;
+use libra_config::{config::NodeConfig, utils};
+use libra_crypto::hash::CryptoHash;
 #[cfg(test)]
 use libradb::test_helper::arb_blocks_to_commit;
 use proptest::prelude::*;
-use std::collections::HashMap;
-use storage_client::{
-    StorageRead, StorageReadServiceClient, StorageWrite, StorageWriteServiceClient,
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
 };
+use storage_client::StorageClient;
 
-fn start_test_storage_with_read_write_client(
-    need_to_use_genesis: bool,
-) -> (
-    libra_tools::tempdir::TempPath,
-    ServerHandle,
-    StorageReadServiceClient,
-    StorageWriteServiceClient,
-) {
-    let mut config = NodeConfigHelpers::get_single_node_test_config(/* random_ports = */ true);
-    let tmp_dir = libra_tools::tempdir::TempPath::new();
-    config.storage.dir = tmp_dir.path().to_path_buf();
+fn start_test_storage_with_client() -> (JoinHandle<()>, libra_temppath::TempPath, StorageClient) {
+    let mut config = NodeConfig::random();
+    let tmp_dir = libra_temppath::TempPath::new();
 
-    // initialize db with genesis info.
-    if need_to_use_genesis {
-        db_with_mock_genesis(&tmp_dir).unwrap();
-    } else {
-        LibraDB::new(&tmp_dir);
-    }
-    let storage_server_handle = start_storage_service(&config);
+    let server_port = utils::get_available_port();
+    config.storage.address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
+    // Test timeout of 5 seconds
+    config.storage.timeout_ms = 5_000;
 
-    let read_client = StorageReadServiceClient::new(
-        Arc::new(EnvBuilder::new().build()),
-        &config.storage.address,
-        config.storage.port,
-    );
-    let write_client = StorageWriteServiceClient::new(
-        Arc::new(EnvBuilder::new().build()),
-        &config.storage.address,
-        config.storage.port,
-        None,
-    );
-    (tmp_dir, storage_server_handle, read_client, write_client)
+    let db = Arc::new(LibraDB::new_for_test(&tmp_dir));
+    let storage_server_handle = start_storage_service_with_db(&config, db);
+
+    let client = StorageClient::new(&config.storage.address, config.storage.timeout_ms);
+    (storage_server_handle, tmp_dir, client)
 }
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10))]
-
     #[test]
-    fn test_storage_service_basic(blocks in arb_blocks_to_commit().no_shrink()) {
-        let(_tmp_dir, _server_handler, read_client, write_client) =
-            start_test_storage_with_read_write_client(/* need_to_use_genesis = */ true);
+    fn test_simple_storage_service(blocks in arb_blocks_to_commit().no_shrink()) {
+        let (_handle, _tmp_dir, client) =
+            start_test_storage_with_client();
 
         let mut version = 0;
+        let mut all_accounts = BTreeMap::new();
+        let mut all_txns = vec![];
+
         for (txns_to_commit, ledger_info_with_sigs) in &blocks {
-            write_client
-                .save_transactions(txns_to_commit.clone(),
-                                   version + 1, /* first_version */
-                                   Some(ledger_info_with_sigs.clone()),
-                ).unwrap();
+            client.save_transactions(
+                txns_to_commit.clone(),
+                version, /* first_version */
+                Some(ledger_info_with_sigs.clone()),
+            ).unwrap();
             version += txns_to_commit.len() as u64;
             let mut account_states = HashMap::new();
             // Get the ground truth of account states.
-            txns_to_commit
-                .iter()
-                .for_each(|txn_to_commit|
-                          account_states.extend(txn_to_commit
-                                                .account_states()
-                                                .clone())
-                );
+            txns_to_commit.iter().for_each(|txn_to_commit| {
+                account_states.extend(txn_to_commit.account_states().clone())
+            });
 
-            let account_state_request_items = account_states
-                .keys()
-                .map(|address| RequestItem::GetAccountState{
-                    address: *address,
-                }).collect::<Vec<_>>();
-            let (
-                response_items,
-                response_ledger_info_with_sigs,
-                _validator_change_events,
-                _ledger_consistency_proof,
-            ) = read_client
-                .update_to_latest_ledger(0, account_state_request_items).unwrap();
-            for ((address, blob), response_item) in zip_eq(account_states, response_items) {
-                    match response_item {
-                        ResponseItem::GetAccountState {
-                            account_state_with_proof,
-                        } => {
-                            prop_assert_eq!(&Some(blob), &account_state_with_proof.blob);
-                            prop_assert!(account_state_with_proof.verify(
-                                response_ledger_info_with_sigs.ledger_info(),
-                                version,
-                                address,
-                            ).is_ok())
-                        }
-                        _ => unreachable!()
-                    }
+            // Record all account states.
+            for (address, blob) in account_states.iter() {
+                all_accounts.insert(address.hash(), blob.clone());
             }
 
-            // Assert ledger info.
-            prop_assert_eq!(ledger_info_with_sigs, &response_ledger_info_with_sigs);
-         }
+            // Record all transactions.
+            all_txns.extend(
+                txns_to_commit
+                    .iter()
+                    .map(|txn_to_commit| txn_to_commit.transaction().clone()),
+            );
+
+            let account_states_returned = account_states
+                .keys()
+                .map(|address| client.get_account_state_with_proof_by_version(*address, version - 1).unwrap())
+                .collect::<Vec<_>>();
+            let startup_info = client.get_startup_info().unwrap().unwrap();
+            for ((address, blob), state_with_proof) in zip_eq(account_states, account_states_returned) {
+                 prop_assert_eq!(&Some(blob), &state_with_proof.0);
+                 prop_assert!(state_with_proof.1
+                     .verify(
+                         startup_info.committed_tree_state.account_state_root_hash,
+                         address.hash(),
+                         state_with_proof.0.as_ref()
+                     )
+                     .is_ok());
+            }
+        }
     }
 }

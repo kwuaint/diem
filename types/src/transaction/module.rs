@@ -6,6 +6,7 @@ use std::fmt;
 
 #[derive(Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Module {
+    #[serde(with = "serde_bytes")]
     code: Vec<u8>,
 }
 
@@ -16,10 +17,6 @@ impl Module {
 
     pub fn code(&self) -> &[u8] {
         &self.code
-    }
-
-    pub fn into_inner(self) -> Vec<u8> {
-        self.code
     }
 }
 

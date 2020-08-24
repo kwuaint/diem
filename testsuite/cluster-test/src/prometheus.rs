@@ -1,14 +1,18 @@
-use failure::{
-    self,
-    prelude::{bail, format_err},
-};
+// Copyright (c) The Libra Core Contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#![forbid(unsafe_code)]
+
+use anyhow::{bail, format_err, Result};
 use reqwest::Url;
 use serde::Deserialize;
 use std::{collections::HashMap, time::Duration};
 
+#[derive(Clone)]
 pub struct Prometheus {
     url: Url,
-    client: reqwest::Client,
+    client: reqwest::blocking::Client,
+    grafana_base_url: Url,
 }
 
 pub struct MatrixResponse {
@@ -20,25 +24,41 @@ pub struct TimeSeries {
 }
 
 impl Prometheus {
-    pub fn new(ip: &str) -> Self {
-        let url = format!("http://{}:9091", ip)
+    pub fn new(ip: &str, grafana_base_url: String) -> Self {
+        let url = format!("http://{}:80", ip)
             .parse()
             .expect("Failed to parse prometheus url");
-        let client = reqwest::Client::new();
-        Self { url, client }
+        let grafana_base_url = grafana_base_url
+            .parse()
+            .expect("Failed to parse prometheus public url");
+        let client = reqwest::blocking::Client::new();
+        Self {
+            url,
+            client,
+            grafana_base_url,
+        }
     }
 
-    pub fn query_range(
+    pub fn link_to_dashboard(&self, start: Duration, end: Duration) -> String {
+        format!(
+            "{}d/overview10/overview?orgId=1&from={}&to={}",
+            self.grafana_base_url,
+            start.as_millis(),
+            end.as_millis()
+        )
+    }
+
+    fn query_range(
         &self,
         query: String,
         start: &Duration,
         end: &Duration,
         step: u64,
-    ) -> failure::Result<MatrixResponse> {
+    ) -> Result<MatrixResponse> {
         let url = self
             .url
             .join(&format!(
-                "api/datasources/proxy/1/api/v1/query_range?query={}&start={}&end={}&step={}",
+                "api/v1/query_range?query={}&start={}&end={}&step={}",
                 query,
                 start.as_secs(),
                 end.as_secs(),
@@ -46,18 +66,18 @@ impl Prometheus {
             ))
             .expect("Failed to make query_range url");
 
-        let mut response = self
+        let response = self
             .client
-            .get(url)
+            .get(url.clone())
             .send()
             .map_err(|e| format_err!("Failed to query prometheus: {:?}", e))?;
 
         // We don't check HTTP error code here
         // Prometheus supplies error status in json response along with error text
 
-        let response: PrometheusResponse = response
-            .json()
-            .map_err(|e| format_err!("Failed to parse prometheus response: {:?}", e))?;
+        let response: PrometheusResponse = response.json().map_err(|e| {
+            format_err!("Failed to parse prometheus response: {:?}. Url: {}", e, url)
+        })?;
 
         match response.data {
             Some(data) => MatrixResponse::from_prometheus(data),
@@ -67,6 +87,18 @@ impl Prometheus {
                 response.error
             ),
         }
+    }
+    pub fn query_range_avg(
+        &self,
+        query: String,
+        start: &Duration,
+        end: &Duration,
+        step: u64,
+    ) -> Result<f64> {
+        let response = self.query_range(query, start, end, step)?;
+        response
+            .avg()
+            .ok_or_else(|| format_err!("Failed to compute avg"))
     }
 }
 
@@ -142,12 +174,12 @@ struct PrometheusResult {
 
 #[derive(Debug, Deserialize)]
 struct PrometheusMetric {
-    op: String,
+    op: Option<String>,
     peer_id: String,
 }
 
 impl MatrixResponse {
-    fn from_prometheus(data: PrometheusData) -> failure::Result<Self> {
+    fn from_prometheus(data: PrometheusData) -> Result<Self> {
         let mut inner = HashMap::new();
         for entry in data.result {
             let peer_id = entry.metric.peer_id;
@@ -162,7 +194,7 @@ impl MatrixResponse {
 }
 
 impl TimeSeries {
-    fn from_prometheus(values: Vec<(u64, String)>) -> failure::Result<Self> {
+    fn from_prometheus(values: Vec<(u64, String)>) -> Result<Self> {
         let mut inner = vec![];
         for (ts, value) in values {
             let value = value.parse().map_err(|e| {

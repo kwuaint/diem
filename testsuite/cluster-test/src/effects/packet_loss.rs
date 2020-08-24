@@ -1,7 +1,14 @@
+// Copyright (c) The Libra Core Contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#![forbid(unsafe_code)]
+
 /// PacketLoss introduces a given percentage of PacketLoss for a given instance
-use crate::{effects::Action, instance::Instance};
-use failure;
-use slog_scope::info;
+use crate::{effects::Effect, instance::Instance};
+use anyhow::Result;
+
+use async_trait::async_trait;
+use libra_logger::info;
 use std::fmt;
 
 pub struct PacketLoss {
@@ -15,17 +22,21 @@ impl PacketLoss {
     }
 }
 
-impl Action for PacketLoss {
-    fn apply(&self) -> failure::Result<()> {
+#[async_trait]
+impl Effect for PacketLoss {
+    async fn activate(&mut self) -> Result<()> {
         info!("PacketLoss {:.*}% for {}", 2, self.percent, self.instance);
-        self.instance.run_cmd(vec![format!(
-            "sudo tc qdisc delete dev eth0 root; sudo tc qdisc add dev eth0 root netem loss {:.*}%",
+        let cmd = format!(
+            "tc qdisc add dev eth0 root netem loss {:.*}%",
             2, self.percent
-        )])
+        );
+        self.instance.util_cmd(cmd, "ac-packet-loss").await
     }
 
-    fn is_complete(&self) -> bool {
-        true
+    async fn deactivate(&mut self) -> Result<()> {
+        info!("PacketLoss {:.*}% for {}", 2, self.percent, self.instance);
+        let cmd = "tc qdisc delete dev eth0 root; true".to_string();
+        self.instance.util_cmd(cmd, "de-packet-loss").await
     }
 }
 

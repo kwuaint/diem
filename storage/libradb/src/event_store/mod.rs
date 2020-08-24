@@ -16,7 +16,7 @@ use crate::{
     },
 };
 use accumulator::{HashReader, MerkleAccumulator};
-use failure::prelude::*;
+use anyhow::{ensure, format_err, Result};
 use libra_crypto::{
     hash::{CryptoHash, EventAccumulatorHasher},
     HashValue,
@@ -31,6 +31,7 @@ use libra_types::{
 use schemadb::{schema::ValueCodec, ReadOptions, DB};
 use std::{convert::TryFrom, sync::Arc};
 
+#[derive(Debug)]
 pub(crate) struct EventStore {
     db: Arc<DB>,
 }

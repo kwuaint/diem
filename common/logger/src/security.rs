@@ -1,195 +1,83 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::error;
-use backtrace::Backtrace;
-use rand::{rngs::SmallRng, FromEntropy, Rng};
-use serde::Serialize;
-use std::fmt::Debug;
+//!
+//! The security module gathers security-related logs:
+//! logs to detect malicious behavior from other validators.
+//!
+//! ```
+//! use libra_logger::prelude::*;
+//!
+//! sl_error!(
+//!   security_log(security_events::INVALID_RETRIEVED_BLOCK)
+//!     .data("some_data", "the data")
+//! );
+//! ```
+//!
 
-#[derive(Serialize)]
-pub enum SecurityEvent {
-    /// Admission Control received a transaction with an invalid signature
-    InvalidTransactionAC,
+use crate::StructuredLogEntry;
 
-    /// Mempool received a transaction with an invalid signature
-    InvalidTransactionMP,
+/// helper function to create a security log
+pub fn security_log(name: &'static str) -> StructuredLogEntry {
+    StructuredLogEntry::new_named("security", &name)
+}
 
-    /// Consensus received a transaction with an invalid signature
-    InvalidTransactionConsensus,
+/// Security events that are possible
+pub mod security_events {
+    // Mempool
+    // -------
 
-    /// Executor received an invalid transactions chunk
-    InvalidChunkExecutor,
+    /// Mempool received a transaction from another peer with an invalid signature
+    pub const INVALID_TRANSACTION_MP: &str = "InvalidTransactionMP";
 
     /// Mempool received an invalid network event
-    InvalidNetworkEventMP,
+    pub const INVALID_NETWORK_EVENT_MP: &str = "INVALID_NETWORK_EVENT_MP";
 
-    /// Consensus received an invalid vote
-    DuplicateConsensusVote,
+    // Consensus
+    // ---------
+
+    /// Consensus received an invalid message (not well-formed or incorrect signature)
+    pub const CONSENSUS_INVALID_MESSAGE: &str = "ConsensusInvalidMessage";
+
+    /// Consensus received an equivocating vote
+    pub const CONSENSUS_EQUIVOCATING_VOTE: &str = "ConsensusEquivocatingVote";
 
     /// Consensus received an invalid proposal
-    InvalidConsensusProposal,
+    pub const INVALID_CONSENSUS_PROPOSAL: &str = "InvalidConsensusProposal";
 
     /// Consensus received an invalid vote
-    InvalidConsensusVote,
+    pub const INVALID_CONSENSUS_VOTE: &str = "InvalidConsensusVote";
 
     /// Consensus received an invalid new round message
-    InvalidConsensusRound,
+    pub const INVALID_CONSENSUS_ROUND: &str = "InvalidConsensusRound";
 
     /// Consensus received an invalid sync info message
-    InvalidSyncInfoMsg,
+    pub const INVALID_SYNC_INFO_MSG: &str = "InvalidSyncInfoMsg";
+
+    /// A received block is invalid
+    pub const INVALID_RETRIEVED_BLOCK: &str = "InvalidRetrievedBlock";
 
     /// A block being committed or executed is invalid
-    InvalidBlock,
+    pub const INVALID_BLOCK: &str = "InvalidBlock";
+
+    // State-Sync
+    // ----------
+
+    /// Invalid chunk of transactions received
+    pub const STATE_SYNC_INVALID_CHUNK: &str = "InvalidChunk";
+
+    // Health Checker
+    // --------------
+
+    /// HealthChecker received an invalid network event
+    pub const INVALID_NETWORK_EVENT_HC: &str = "InvalidNetworkEventHC";
+
+    /// HealthChecker received an invalid message
+    pub const INVALID_HEALTHCHECKER_MSG: &str = "InvalidHealthCheckerMsg";
+
+    // Network
+    // -------
 
     /// Network identified an invalid peer
-    InvalidNetworkPeer,
-
-    /// Network discovery received an invalid DiscoveryMsg
-    InvalidDiscoveryMsg,
-
-    /// Error for testing
-    #[cfg(test)]
-    TestError,
-}
-
-/// The `SecurityLog` struct is used to log security-sensitive operations, for instance when an
-/// invalid signature is detected or when an unexpected event happens.
-///
-/// The `security_log()` function should be used to instantiate this struct. It can be decorated
-/// with different type of metadata:
-/// - `event` contains a pre-defined element in the `SecurityEvent` enum
-/// - `error` can contain an error type provided by the application
-/// - `data` can contain associated metadata related to the event
-/// - `backtrace` can contain a backtrace of the current call stack
-///
-/// All these information can be defined by using the appropriate function with the same name.
-///
-/// The method `log()` needs to be called to ensure that the event is actually printed.
-///
-/// # Example:
-/// ```rust
-/// use libra_logger::prelude::*;
-/// use std::fmt::Debug;
-///
-/// #[derive(Debug)]
-/// struct SampleData {
-///     i: u8,
-///     s: Vec<u8>,
-/// }
-///
-/// #[derive(Debug)]
-/// enum TestError {
-///     Error,
-/// }
-///
-/// pub fn main() {
-///     security_log(SecurityEvent::InvalidTransactionAC)
-///         .error(&TestError::Error)
-///         .data(&SampleData {
-///             i: 0xff,
-///             s: vec![0x90, 0xcd, 0x80],
-///         })
-///         .data("additional payload")
-///         .backtrace(100)
-///         .log();
-/// }
-/// ```
-/// In this example, `security_log()` logs an event of type `SecurityEvent::InvalidTransactionAC`,
-/// having `TestError::Error` as application error, a `SimpleData` struct and a `String` as
-/// additional metadata, and a backtrace that samples 100% of the times.
-
-#[must_use = "must use `log()`"]
-#[derive(Serialize)]
-pub struct SecurityLog {
-    event: SecurityEvent,
-    error: Option<String>,
-    data: Vec<String>,
-    backtrace: Option<Backtrace>,
-}
-
-/// Creates a `SecurityLog` struct that can be decorated with additional data.
-pub fn security_log(event: SecurityEvent) -> SecurityLog {
-    SecurityLog::new(event)
-}
-
-impl SecurityLog {
-    pub(crate) fn new(event: SecurityEvent) -> Self {
-        SecurityLog {
-            event,
-            error: None,
-            data: Vec::new(),
-            backtrace: None,
-        }
-    }
-
-    /// Adds additional metadata to the `SecurityLog` struct. The argument needs to implement the
-    /// `std::fmt::Debug` trait.
-    pub fn data<T: Debug>(mut self, data: T) -> Self {
-        let data = format!("{:?}", data);
-        if usize::checked_add(self.data.len(), 1).is_some() {
-            self.data.push(data);
-        }
-        self
-    }
-
-    /// Adds an application error to the `SecurityLog` struct. The argument needs to implement the
-    /// `std::fmt::Debug` trait.
-    pub fn error<T: Debug>(mut self, error: T) -> Self {
-        self.error = Some(format!("{:?}", error));
-        self
-    }
-
-    /// Adds a backtrace to the `SecurityLog` struct.
-    pub fn backtrace(mut self, sampling_rate: u8) -> Self {
-        let sampling_rate = std::cmp::min(sampling_rate, 100);
-        self.backtrace = {
-            let mut rng = SmallRng::from_entropy();
-            match rng.gen_range(0, 100) {
-                x if x < sampling_rate => Some(Backtrace::new()),
-                _ => None,
-            }
-        };
-        self
-    }
-
-    pub(crate) fn to_string(&self) -> String {
-        serde_json::to_string(&self).unwrap_or_else(|e| e.to_string())
-    }
-
-    /// Prints the `SecurityEvent` struct.
-    pub fn log(self) {
-        error!("[security] {}", self.to_string());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[derive(Debug)]
-    struct SampleData {
-        i: u8,
-        s: Vec<u8>,
-    }
-
-    #[derive(Debug)]
-    enum TestError {
-        Error,
-    }
-
-    #[test]
-    fn test_log() {
-        let s = security_log(SecurityEvent::TestError)
-            .error(&TestError::Error)
-            .data(&SampleData {
-                i: 0xff,
-                s: vec![0x90, 0xcd, 0x80],
-            })
-            .data("second_payload");
-        assert_eq!(
-            s.to_string(),
-            r#"{"event":"TestError","error":"Error","data":["SampleData { i: 255, s: [144, 205, 128] }","\"second_payload\""],"backtrace":null}"#,
-        );
-    }
+    pub const INVALID_NETWORK_PEER: &str = "InvalidNetworkPeer";
 }

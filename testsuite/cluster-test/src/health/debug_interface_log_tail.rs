@@ -1,85 +1,100 @@
+// Copyright (c) The Libra Core Contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#![forbid(unsafe_code)]
+
 use crate::{
     cluster::Cluster,
-    health::{Commit, Event, LogTail, ValidatorEvent},
+    health::{log_tail::TraceTail, Commit, Event, LogTail, ValidatorEvent},
     instance::Instance,
     util::unix_timestamp_now,
 };
-use debug_interface::{
-    self,
-    proto::{Event as DebugInterfaceEvent, GetEventsRequest, NodeDebugInterfaceClient},
-};
-use grpcio::{self, ChannelBuilder, EnvBuilder};
+use debug_interface::AsyncNodeDebugClient;
+use libra_logger::{json_log::JsonLogEntry as DebugInterfaceEvent, *};
 use serde_json::{self, value as json};
 use std::{
     env,
-    sync::{atomic::AtomicI64, mpsc, Arc},
-    thread,
+    sync::{
+        atomic::{AtomicBool, AtomicI64, Ordering},
+        mpsc, Arc, Mutex,
+    },
     time::Duration,
 };
+use tokio::{runtime::Handle, time};
 
-pub struct DebugPortLogThread {
+pub struct DebugPortLogWorker {
     instance: Instance,
-    client: NodeDebugInterfaceClient,
+    client: AsyncNodeDebugClient,
     event_sender: mpsc::Sender<ValidatorEvent>,
     started_sender: Option<mpsc::Sender<()>>,
+    pending_messages: Arc<AtomicI64>,
+    trace_sender: mpsc::Sender<(String, DebugInterfaceEvent)>,
+    trace_enabled: Arc<AtomicBool>,
 }
 
-impl DebugPortLogThread {
-    pub fn spawn_new(cluster: &Cluster) -> LogTail {
+impl DebugPortLogWorker {
+    pub fn spawn_new(cluster: &Cluster) -> (LogTail, TraceTail) {
+        let runtime = Handle::current();
         let (event_sender, event_receiver) = mpsc::channel();
-        let env = Arc::new(EnvBuilder::new().name_prefix("grpc-log-tail-").build());
         let mut started_receivers = vec![];
-        for instance in cluster.instances() {
-            let ch =
-                ChannelBuilder::new(env.clone()).connect(&format!("{}:{}", instance.ip(), 6191));
+        let pending_messages = Arc::new(AtomicI64::new(0));
+        let (trace_sender, trace_receiver) = mpsc::channel();
+        let trace_enabled = Arc::new(AtomicBool::new(false));
+        for instance in cluster.validator_and_fullnode_instances() {
             let (started_sender, started_receiver) = mpsc::channel();
             started_receivers.push(started_receiver);
-            let client = NodeDebugInterfaceClient::new(ch);
-            let debug_port_log_thread = DebugPortLogThread {
+            let client = instance.debug_interface_client();
+            let debug_port_log_worker = DebugPortLogWorker {
                 instance: instance.clone(),
                 client,
                 event_sender: event_sender.clone(),
                 started_sender: Some(started_sender),
+                pending_messages: pending_messages.clone(),
+                trace_sender: trace_sender.clone(),
+                trace_enabled: trace_enabled.clone(),
             };
-            thread::Builder::new()
-                .name(format!("log-tail-{}", instance.short_hash()))
-                .spawn(move || debug_port_log_thread.run())
-                .expect("Failed to spawn log tail thread");
+            runtime.spawn(debug_port_log_worker.run());
         }
         for r in started_receivers {
             if let Err(e) = r.recv() {
                 panic!("Failed to start one of debug port log threads: {:?}", e);
             }
         }
-        LogTail {
-            event_receiver,
-            pending_messages: Arc::new(AtomicI64::new(0)),
-        }
+        (
+            LogTail {
+                event_receiver,
+                pending_messages,
+            },
+            TraceTail {
+                trace_enabled,
+                trace_receiver: Mutex::new(trace_receiver),
+            },
+        )
     }
 }
 
-impl DebugPortLogThread {
-    pub fn run(mut self) {
+impl DebugPortLogWorker {
+    pub async fn run(mut self) {
         let print_failures = env::var("VERBOSE").is_ok();
         loop {
-            let opts = grpcio::CallOption::default().timeout(Duration::from_secs(5));
-            match self
-                .client
-                .get_events_opt(&GetEventsRequest::default(), opts)
-            {
+            match self.client.get_events().await {
                 Err(e) => {
                     if print_failures {
-                        println!("Failed to get events from {}: {:?}", self.instance, e);
+                        info!("Failed to get events from {}: {:?}", self.instance, e);
                     }
-                    thread::sleep(Duration::from_secs(1));
+                    time::delay_for(Duration::from_secs(1)).await;
                 }
                 Ok(resp) => {
-                    for event in resp.events.into_iter() {
+                    let mut sent_events = 0i64;
+                    for event in resp {
                         if let Some(e) = self.parse_event(event) {
                             let _ignore = self.event_sender.send(e);
+                            sent_events += 1;
                         }
                     }
-                    thread::sleep(Duration::from_millis(200));
+                    self.pending_messages
+                        .fetch_add(sent_events, Ordering::Relaxed);
+                    time::delay_for(Duration::from_millis(100)).await;
                 }
             }
             if let Some(started_sender) = self.started_sender.take() {
@@ -91,24 +106,24 @@ impl DebugPortLogThread {
     }
 
     fn parse_event(&self, event: DebugInterfaceEvent) -> Option<ValidatorEvent> {
-        let json: json::Value =
-            serde_json::from_str(&event.json).expect("Failed to parse json from debug interface");
-
         let e = if event.name == "committed" {
-            Self::parse_commit(json)
+            Self::parse_commit(&event.json)
         } else {
-            println!("Unknown event: {} from {}", event.name, self.instance);
+            if self.trace_enabled.load(Ordering::Relaxed) {
+                let peer = self.instance.peer_name().clone();
+                let _ignore = self.trace_sender.send((peer, event));
+            }
             return None;
         };
         Some(ValidatorEvent {
-            validator: self.instance.short_hash().clone(),
+            validator: self.instance.peer_name().clone(),
             timestamp: Duration::from_millis(event.timestamp as u64),
             received_timestamp: unix_timestamp_now(),
             event: e,
         })
     }
 
-    fn parse_commit(json: json::Value) -> Event {
+    fn parse_commit(json: &json::Value) -> Event {
         Event::Commit(Commit {
             commit: json
                 .get("block_id")

@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! # Grammar
 //! ## Identifiers
 //! ```text
@@ -19,7 +21,9 @@
 //!
 //! g ∈ GroundType ::=
 //!   | bool
+//!   | u8        // unsigned 8 bit integer
 //!   | u64       // unsigned 64 bit integer
+//!   | u128      // unsigned 128 bit integer
 //!   | address   // 32 byte account address
 //!   | bytearray // immutable, arbitrarily sized array of bytes
 //!
@@ -47,7 +51,7 @@
 //! ```text
 //! u ∈ Unsigned64        // Unsigned, 64-bit Integer
 //! addr ∈ AccountAddress // addresses of blockchain accounts
-//! bytes ∈ ByteArray     // byte array of arbitrary length
+//! bytes ∈ vector<u8>    // byte array of arbitrary length
 //! v ∈ Value ::=
 //!   | true
 //!   | false
@@ -103,9 +107,6 @@
 //! ```text
 //! // module operators are available only inside the module that declares n.
 //! mop ∈ ModuleOp ::=
-//!   | move_to_sender<n>(e) // type: 'Self.n -> unit'
-//!                          // publishes resource struct 'n' under sender's address
-//!                          // fails if there is already a resource present for 'Self.n'
 //!   | move_from<n>(e)      // type: 'address -> Self.n'
 //!                          // removes the resource struct 'n' at the specified address
 //!                          // fails if there is no resource present for 'Self.n'
@@ -124,18 +125,6 @@
 //!                               // releases the reference given
 //!   | freeze(x)                 // type: '&mut t -> &t'
 //!                               // coerce a mutable reference to an immutable reference
-//!   | get_txn_gas_unit_price()  // type: 'unit -> u64'
-//!                               // gives the price specified per gas unit
-//!   | get_txn_max_gas_units()   // type: 'unit -> u64'
-//!                               // gives the tranaction's maximum amount of usable gas units
-//!   | get_txn_public_key()      // type: 'unit -> bytearray'
-//!                               // gives the transaction's public key
-//!   | get_txn_sender()          // type: 'unit -> address'
-//!                               // gives the transaction's sender's account address
-//!   | get_txn_sequence_number() // type: 'unit -> u64'
-//!                               // gives the sequence number for this transaction
-//!   | get_gas_remaining()       // type: 'unit -> u64'
-//!                               // gives the amount of gas gas units remaining before the transaction execution will be forced to halt execution
 //!
 //! call ∈ Call ::=
 //!   | mop
@@ -203,6 +192,5 @@
 //!   | idecl_1 ... idecl_i public main(x_1: g_1, ..., x_j: g_j) { s }
 //! ```
 
-pub mod ast;
 mod lexer;
 pub mod syntax;

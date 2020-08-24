@@ -1,9 +1,16 @@
+// Copyright (c) The Libra Core Contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#![forbid(unsafe_code)]
+
 use crate::health::{Event, HealthCheck, HealthCheckContext, ValidatorEvent};
+use async_trait::async_trait;
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 
 /// Verifies that commit history produced by validators is 'lineariazble'
 /// This means that validators can be behind each other, but commits that they are producing
 /// do not contradict each other
+#[derive(Default)]
 pub struct CommitHistoryHealthCheck {
     round_to_commit: HashMap<u64, CommitAndValidators>,
     latest_committed_round: HashMap<String, u64>,
@@ -16,13 +23,11 @@ struct CommitAndValidators {
 
 impl CommitHistoryHealthCheck {
     pub fn new() -> Self {
-        Self {
-            round_to_commit: HashMap::new(),
-            latest_committed_round: HashMap::new(),
-        }
+        Default::default()
     }
 }
 
+#[async_trait]
 impl HealthCheck for CommitHistoryHealthCheck {
     fn on_event(&mut self, ve: &ValidatorEvent, ctx: &mut HealthCheckContext) {
         let commit = if let Event::Commit(ref commit) = ve.event {
@@ -80,6 +85,8 @@ impl HealthCheck for CommitHistoryHealthCheck {
             self.round_to_commit.retain(|k, _v| *k >= *min_round);
         }
     }
+
+    async fn verify(&mut self, _ctx: &mut HealthCheckContext) {}
 
     fn clear(&mut self) {
         self.round_to_commit.clear();

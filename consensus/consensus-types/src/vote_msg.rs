@@ -2,15 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{sync_info::SyncInfo, vote::Vote};
-#[cfg(any(test, feature = "fuzzing"))]
-use failure::bail;
+use anyhow::ensure;
+use libra_crypto::HashValue;
+use libra_types::validator_verifier::ValidatorVerifier;
 use serde::{Deserialize, Serialize};
-#[cfg(any(test, feature = "fuzzing"))]
-use std::convert::TryInto;
-use std::{
-    convert::TryFrom,
-    fmt::{Display, Formatter},
-};
+use std::fmt::{Display, Formatter};
 
 /// VoteMsg is the struct that is ultimately sent by the voter in response for
 /// receiving a proposal.
@@ -44,34 +40,23 @@ impl VoteMsg {
     pub fn sync_info(&self) -> &SyncInfo {
         &self.sync_info
     }
-}
 
-#[cfg(any(test, feature = "fuzzing"))]
-impl TryFrom<network::proto::ConsensusMsg> for VoteMsg {
-    type Error = failure::Error;
-
-    fn try_from(proto: network::proto::ConsensusMsg) -> failure::Result<Self> {
-        match proto.message {
-            Some(network::proto::ConsensusMsg_oneof::VoteMsg(vote_msg)) => vote_msg.try_into(),
-            _ => bail!("Missing vote"),
-        }
+    pub fn epoch(&self) -> u64 {
+        self.vote.epoch()
     }
-}
 
-impl TryFrom<network::proto::VoteMsg> for VoteMsg {
-    type Error = failure::Error;
-
-    fn try_from(proto: network::proto::VoteMsg) -> failure::Result<Self> {
-        Ok(lcs::from_bytes(&proto.bytes)?)
+    pub fn proposed_block_id(&self) -> HashValue {
+        self.vote.vote_data().proposed().id()
     }
-}
 
-impl TryFrom<VoteMsg> for network::proto::VoteMsg {
-    type Error = failure::Error;
-
-    fn try_from(vote_msg: VoteMsg) -> failure::Result<Self> {
-        Ok(Self {
-            bytes: lcs::to_bytes(&vote_msg)?,
-        })
+    pub fn verify(&self, validator: &ValidatorVerifier) -> anyhow::Result<()> {
+        ensure!(
+            self.vote().epoch() == self.sync_info.epoch(),
+            "VoteMsg has different epoch"
+        );
+        // We're not verifying SyncInfo here yet: we are going to verify it only in case we need
+        // it. This way we avoid verifying O(n) SyncInfo messages while aggregating the votes
+        // (O(n^2) signature verifications).
+        self.vote().verify(validator)
     }
 }

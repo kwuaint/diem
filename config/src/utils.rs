@@ -1,15 +1,11 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::config::NodeConfig;
 use get_if_addrs::get_if_addrs;
-use libra_types::transaction::SCRIPT_HASH_LENGTH;
-use parity_multiaddr::{Multiaddr, Protocol};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{
-    collections::HashSet,
-    hash::BuildHasher,
-    net::{IpAddr, TcpListener, TcpStream},
-};
+use libra_network_address::{NetworkAddress, Protocol};
+use libra_types::transaction::Transaction;
+use std::net::{TcpListener, TcpStream};
 
 /// Return an ephemeral, available port. On unix systems, the port returned will be in the
 /// TIME_WAIT state ensuring that the OS won't hand out this port for some grace period.
@@ -41,55 +37,24 @@ fn get_ephemeral_port() -> ::std::io::Result<u16> {
 }
 
 /// Extracts one local non-loopback IP address, if one exists. Otherwise returns None.
-pub fn get_local_ip() -> Option<Multiaddr> {
+pub fn get_local_ip() -> Option<NetworkAddress> {
     get_if_addrs().ok().and_then(|if_addrs| {
         if_addrs
-            .into_iter()
+            .iter()
             .find(|if_addr| !if_addr.is_loopback())
-            .and_then(|if_addr| {
-                let mut addr = Multiaddr::empty();
-                match if_addr.ip() {
-                    IpAddr::V4(a) => {
-                        addr.push(Protocol::Ip4(a));
-                    }
-                    IpAddr::V6(a) => {
-                        addr.push(Protocol::Ip6(a));
-                    }
-                }
-                Some(addr)
-            })
+            .map(|if_addr| NetworkAddress::from(Protocol::from(if_addr.ip())))
     })
 }
 
-pub fn deserialize_whitelist<'de, D>(
-    deserializer: D,
-) -> ::std::result::Result<HashSet<[u8; SCRIPT_HASH_LENGTH]>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let whitelisted_scripts: Vec<String> = Deserialize::deserialize(deserializer)?;
-    let whitelist = whitelisted_scripts
-        .iter()
-        .map(|s| {
-            let mut hash = [0u8; SCRIPT_HASH_LENGTH];
-            let decoded_hash =
-                hex::decode(s).expect("Unable to decode script hash from configuration file.");
-            assert_eq!(decoded_hash.len(), SCRIPT_HASH_LENGTH);
-            hash.copy_from_slice(decoded_hash.as_slice());
-            hash
-        })
-        .collect();
-    Ok(whitelist)
+pub fn get_available_port_in_multiaddr(is_ipv4: bool) -> NetworkAddress {
+    let ip_proto = if is_ipv4 {
+        Protocol::Ip4("0.0.0.0".parse().unwrap())
+    } else {
+        Protocol::Ip6("::1".parse().unwrap())
+    };
+    NetworkAddress::from(ip_proto).push(Protocol::Tcp(get_available_port()))
 }
 
-pub fn serialize_whitelist<S, H>(
-    whitelist: &HashSet<[u8; SCRIPT_HASH_LENGTH], H>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-    H: BuildHasher,
-{
-    let encoded_whitelist: Vec<String> = whitelist.iter().map(hex::encode).collect();
-    encoded_whitelist.serialize(serializer)
+pub fn get_genesis_txn(config: &NodeConfig) -> Option<&Transaction> {
+    config.execution.genesis.as_ref()
 }

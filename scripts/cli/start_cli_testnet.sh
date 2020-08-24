@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (c) The Libra Core Contributors
+# SPDX-License-Identifier: Apache-2.0
 
 print_help()
 {
@@ -11,7 +13,7 @@ source "$HOME/.cargo/env"
 
 SCRIPT_PATH="$(dirname $0)"
 
-RUN_PARAMS="--host ac.testnet.libra.org --port 8000 -s $SCRIPT_PATH/consensus_peers.config.toml"
+RUN_PARAMS="--url https://client.testnet.libra.org/v1 --waypoint_url https://developers.libra.org/testnet_waypoint.txt --chain-id TESTNET"
 RELEASE=""
 
 while [[ ! -z "$1" ]]; do
@@ -36,4 +38,4 @@ else
 	echo "Building and running client in release mode."
 fi
 
-cargo run -p client $RELEASE -- $RUN_PARAMS "$@"
+cargo run -p cli $RELEASE -- $RUN_PARAMS "$@"

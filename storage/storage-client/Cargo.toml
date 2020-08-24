@@ -10,17 +10,16 @@ publish = false
 edition = "2018"
 
 [dependencies]
-futures = { version = "=0.3.0-alpha.19", package = "futures-preview", features = ["compat"] }
-futures_01 = { version = "0.1.28", package = "futures" }
-grpcio = { version = "=0.5.0-alpha.4", default-features = false, features = ["prost-codec"] }
-rand = "0.6.5"
+anyhow = "1.0.32"
+serde = "1.0.114"
+
+lcs = { path = "../../common/lcs", version = "0.1.0", package = "libra-canonical-serialization" }
 libra-crypto = { path = "../../crypto/crypto", version = "0.1.0" }
-failure = { path = "../../common/failure-ext", version = "0.1.0", package = "libra-failure-ext" }
-scratchpad = { path = "../scratchpad", version = "0.1.0" }
-libra-state-view = { path = "../state-view", version = "0.1.0" }
-storage-proto = { path = "../storage-proto", version = "0.1.0" }
+libra-logger = { path = "../../common/logger", version = "0.1.0" }
+libra-secure-net = { path = "../../secure/net", version = "0.1.0" }
 libra-types = { path = "../../types", version = "0.1.0" }
+libra-workspace-hack = { path = "../../common/workspace-hack", version = "0.1.0" }
+storage-interface = { path = "../storage-interface", version = "0.1.0" }
 
 [features]
 default = []
-fuzzing = ["libra-types/fuzzing"]

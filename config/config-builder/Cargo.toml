@@ -10,19 +10,30 @@ publish = false
 edition = "2018"
 
 [dependencies]
-hex = { version = "0.3.2", default-features = false }
-parity-multiaddr = { version = "0.5.0", default-features = false }
-rand = "0.6.5"
-structopt = "0.3.2"
+anyhow = "1.0.32"
+hex = "0.4.2"
+rand = "0.7.3"
+structopt = "0.3.15"
+thiserror = "1.0.20"
 
+executor = { path = "../../execution/executor", version = "0.1.0" }
+generate-key = { path = "../../config/generate-key", version = "0.1.0" }
+lcs = { path = "../../common/lcs", version = "0.1.0", package = "libra-canonical-serialization" }
 libra-config = { path = "..", version = "0.1.0" }
 libra-crypto = { path = "../../crypto/crypto", version = "0.1.0" }
-failure = { path = "../../common/failure-ext", version = "0.1.0", package = "libra-failure-ext" }
-generate-keypair = { path = "../generate-keypair", version = "0.1.0" }
 libra-logger = { path = "../../common/logger", version = "0.1.0" }
-libra-prost-ext = { path = "../../common/prost-ext", version = "0.1.0" }
+libra-network-address = { path = "../../network/network-address", version = "0.1.0" }
+libra-temppath = { path = "../../common/temppath", version = "0.1.0" }
 libra-types = { path = "../../types", version = "0.1.0" }
-vm-genesis = { path = "../../language/vm/vm-genesis", version = "0.1.0" }
+libra-vm = { path = "../../language/libra-vm", version = "0.1.0" }
+libra-workspace-hack = { path = "../../common/workspace-hack", version = "0.1.0" }
+libradb = { path = "../../storage/libradb", version = "0.1.0" }
+storage-interface = { path = "../../storage/storage-interface", version = "0.1.0" }
+transaction-builder = { path = "../../language/transaction-builder", version = "0.1.0" }
+vm-genesis = { path = "../../language/tools/vm-genesis", version = "0.1.0" }
+
+[dev-dependencies]
+libra-config = { path = "..", version = "0.1.0", features = ["fuzzing"] }
 
 [features]
 default = []
