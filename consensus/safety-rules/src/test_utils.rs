@@ -1,7 +1,10 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::persistent_safety_storage::PersistentSafetyStorage;
+use crate::{
+    persistent_safety_storage::PersistentSafetyStorage, serializer::SerializerService, SafetyRules,
+    TSafetyRules,
+};
 use consensus_types::{
     block::Block,
     common::{Payload, Round},
@@ -11,14 +14,15 @@ use consensus_types::{
     vote_data::VoteData,
     vote_proposal::{MaybeSignedVoteProposal, VoteProposal},
 };
-use libra_crypto::{
+use diem_crypto::{
     ed25519::Ed25519PrivateKey,
     hash::{CryptoHash, TransactionAccumulatorHasher},
     traits::SigningKey,
     Uniform,
 };
-use libra_secure_storage::{InMemoryStorage, Storage};
-use libra_types::{
+use diem_infallible::duration_since_epoch;
+use diem_secure_storage::{InMemoryStorage, Storage};
+use diem_types::{
     block_info::BlockInfo,
     epoch_change::EpochChangeProof,
     epoch_state::EpochState,
@@ -29,10 +33,7 @@ use libra_types::{
     validator_signer::ValidatorSigner,
     waypoint::Waypoint,
 };
-use std::{
-    collections::BTreeMap,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::collections::BTreeMap;
 
 pub type Proof = AccumulatorExtensionProof<TransactionAccumulatorHasher>;
 
@@ -65,10 +66,7 @@ pub fn make_proposal_with_qc_and_proof(
         Block::new_proposal(
             payload,
             round,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            duration_since_epoch().as_secs(),
             qc,
             validator_signer,
         ),
@@ -222,5 +220,30 @@ pub fn test_storage(signer: &ValidatorSigner) -> PersistentSafetyStorage {
         signer.private_key().clone(),
         Ed25519PrivateKey::generate_for_testing(),
         waypoint,
+        true,
     )
+}
+
+/// Returns a safety rules instance for testing purposes.
+pub fn test_safety_rules() -> SafetyRules {
+    let signer = ValidatorSigner::from_int(0);
+    let storage = test_storage(&signer);
+    let (epoch_change_proof, _) = make_genesis(&signer);
+
+    let mut safety_rules = SafetyRules::new(storage, true, false);
+    safety_rules.initialize(&epoch_change_proof).unwrap();
+    safety_rules
+}
+
+/// Returns a safety rules instance that has not been initialized for testing purposes.
+pub fn test_safety_rules_uninitialized() -> SafetyRules {
+    let signer = ValidatorSigner::from_int(0);
+    let storage = test_storage(&signer);
+    SafetyRules::new(storage, true, false)
+}
+
+/// Returns a simple serializer for testing purposes.
+pub fn test_serializer() -> SerializerService {
+    let safety_rules = test_safety_rules();
+    SerializerService::new(safety_rules)
 }

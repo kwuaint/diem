@@ -1,15 +1,14 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::Executor;
 use anyhow::Result;
-use executor_types::ChunkExecutor;
-use libra_crypto::HashValue;
-use libra_state_view::StateView;
-use libra_types::{
+use diem_crypto::{hash::SPARSE_MERKLE_PLACEHOLDER_HASH, HashValue};
+use diem_state_view::StateView;
+use diem_types::{
     account_address::AccountAddress,
     account_state_blob::{AccountStateBlob, AccountStateWithProof},
-    contract_event::ContractEvent,
+    contract_event::{ContractEvent, EventWithProof},
     epoch_change::EpochChangeProof,
     event::EventKey,
     ledger_info::LedgerInfoWithSignatures,
@@ -20,20 +19,40 @@ use libra_types::{
     },
     vm_status::VMStatus,
 };
-use libra_vm::VMExecutor;
+use diem_vm::VMExecutor;
+use executor_types::{BlockExecutor, ChunkExecutor};
 use storage_interface::{DbReader, DbReaderWriter, DbWriter, Order, StartupInfo, TreeState};
 
-pub fn fuzz(
-    txn_list_with_proof: TransactionListWithProof,
-    verified_target_li: LedgerInfoWithSignatures,
-) {
+fn create_test_executor() -> Executor<FakeVM> {
     // setup fake db
     let fake_db = FakeDb {};
     let db_reader_writer = DbReaderWriter::new(fake_db);
-    let mut executor = Executor::<FakeVM>::new(db_reader_writer);
+    Executor::<FakeVM>::new(db_reader_writer)
+}
 
-    //
+pub fn fuzz_execute_and_commit_chunk(
+    txn_list_with_proof: TransactionListWithProof,
+    verified_target_li: LedgerInfoWithSignatures,
+) {
+    let mut executor = create_test_executor();
     let _events = executor.execute_and_commit_chunk(txn_list_with_proof, verified_target_li, None);
+}
+
+pub fn fuzz_execute_and_commit_blocks(
+    blocks: Vec<(HashValue, Vec<Transaction>)>,
+    ledger_info_with_sigs: LedgerInfoWithSignatures,
+) {
+    let mut executor = create_test_executor();
+
+    let mut parent_block_id = *SPARSE_MERKLE_PLACEHOLDER_HASH;
+    let mut block_ids = vec![];
+    for block in blocks {
+        let block_id = block.0;
+        let _execution_results = executor.execute_block(block, parent_block_id);
+        parent_block_id = block_id;
+        block_ids.push(block_id);
+    }
+    let _res = executor.commit_blocks(block_ids, ledger_info_with_sigs);
 }
 
 /// A fake VM implementing VMExecutor
@@ -81,6 +100,17 @@ impl DbReader for FakeDb {
         _order: Order,
         _limit: u64,
     ) -> Result<Vec<(u64, ContractEvent)>> {
+        unimplemented!();
+    }
+
+    fn get_events_with_proofs(
+        &self,
+        _event_key: &EventKey,
+        _start: u64,
+        _order: Order,
+        _limit: u64,
+        _known_version: Option<u64>,
+    ) -> Result<Vec<EventWithProof>> {
         unimplemented!();
     }
 
@@ -151,7 +181,10 @@ impl DbReader for FakeDb {
         &self,
         _address: AccountAddress,
         _version: Version,
-    ) -> Result<(Option<AccountStateBlob>, SparseMerkleProof)> {
+    ) -> Result<(
+        Option<AccountStateBlob>,
+        SparseMerkleProof<AccountStateBlob>,
+    )> {
         unimplemented!();
     }
 

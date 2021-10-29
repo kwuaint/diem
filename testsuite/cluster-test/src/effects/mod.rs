@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -10,6 +10,7 @@ use std::fmt::Display;
 
 pub mod network_delay;
 pub mod packet_loss;
+pub mod stop_validator;
 
 #[async_trait]
 pub trait Effect: Display {

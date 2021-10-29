@@ -1,28 +1,28 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 package main
 
 import (
 	"fmt"
-	stdlib "testing/librastdlib"
-	libra "testing/libratypes"
+	stdlib "testing/diemstdlib"
+	diem "testing/diemtypes"
 )
 
 func main() {
-	token := &libra.TypeTag__Struct{
-		Value: libra.StructTag{
-			Address: libra.AccountAddress{
-				Value: [16]uint8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
-			},
-			Module:     libra.Identifier{Value: "LBR"},
-			Name:       libra.Identifier{Value: "LBR"},
-			TypeParams: []libra.TypeTag{},
+	token := &diem.TypeTag__Struct{
+		Value: diem.StructTag{
+			Address: diem.AccountAddress(
+				[16]uint8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+			),
+			Module:     diem.Identifier("XDX"),
+			Name:       diem.Identifier("XDX"),
+			TypeParams: []diem.TypeTag{},
 		},
 	}
-	payee := libra.AccountAddress{
-		Value: [16]uint8{0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22},
-	}
+	payee := diem.AccountAddress(
+		[16]uint8{0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22},
+	)
 	amount := uint64(1_234_567)
 	script := stdlib.EncodePeerToPeerWithMetadataScript(token, payee, amount, []uint8{}, []uint8{})
 
@@ -35,11 +35,11 @@ func main() {
 		panic("wrong script content")
 	}
 
-	bytes, err := script.LcsSerialize()
+	bytes, err := script.BcsSerialize()
 	if err != nil {
 		panic("failed to serialize")
 	}
-	for _, b := range(bytes) {
+	for _, b := range bytes {
 		fmt.Printf("%d ", b)
 	}
 	fmt.Printf("\n")

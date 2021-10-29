@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod atomic_histogram;
@@ -20,13 +20,6 @@ pub mod suite;
 pub mod tx_emitter;
 
 pub mod util {
-    use std::time::{Duration, SystemTime};
-
-    pub fn unix_timestamp_now() -> Duration {
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("now < UNIX_EPOCH")
-    }
 
     pub fn human_readable_bytes_per_sec(bytes_per_sec: f64) -> String {
         if bytes_per_sec.round() < 1024.0 {

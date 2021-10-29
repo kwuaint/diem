@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{access_path::AccessPath, transaction::Version};
@@ -18,4 +18,7 @@ pub trait MoveStorage {
         access_paths: Vec<AccessPath>,
         version: Version,
     ) -> Result<Vec<Vec<u8>>>;
+
+    /// Get the version on the latest transaction info.
+    fn fetch_synced_version(&self) -> Result<Version>;
 }

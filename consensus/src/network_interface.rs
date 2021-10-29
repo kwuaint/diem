@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Interface between Consensus and Network layers.
@@ -12,9 +12,8 @@ use consensus_types::{
     sync_info::SyncInfo,
     vote_msg::VoteMsg,
 };
-use inject_error::inject_error;
-use libra_metrics::IntCounterVec;
-use libra_types::{epoch_change::EpochChangeProof, PeerId};
+use diem_metrics::IntCounterVec;
+use diem_types::{epoch_change::EpochChangeProof, PeerId};
 use network::{
     constants::NETWORK_CHANNEL_SIZE,
     error::NetworkError,
@@ -104,7 +103,6 @@ impl NewNetworkSender for ConsensusNetworkSender {
 impl ConsensusNetworkSender {
     /// Send a single message to the destination peer using the `CONSENSUS_DIRECT_SEND_PROTOCOL`
     /// ProtocolId.
-    #[inject_error(probability = 0.05)]
     pub fn send_to(
         &mut self,
         recipient: PeerId,
@@ -116,7 +114,6 @@ impl ConsensusNetworkSender {
 
     /// Send a single message to the destination peers using the `CONSENSUS_DIRECT_SEND_PROTOCOL`
     /// ProtocolId.
-    #[inject_error(probability = 0.05)]
     pub fn send_to_many(
         &mut self,
         recipients: impl Iterator<Item = PeerId>,
@@ -128,7 +125,6 @@ impl ConsensusNetworkSender {
     }
 
     /// Send a RPC to the destination peer using the `CONSENSUS_RPC_PROTOCOL` ProtocolId.
-    #[inject_error(probability = 0.05)]
     pub async fn send_rpc(
         &mut self,
         recipient: PeerId,

@@ -1,13 +1,13 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    account_commands::AccountCommand, client_proxy::ClientProxy, dev_commands::DevCommand,
-    info_commands::InfoCommand, query_commands::QueryCommand, transfer_commands::TransferCommand,
+    account_commands::AccountCommand, client_proxy::ClientProxy, counters::COUNTER_CLIENT_ERRORS,
+    dev_commands::DevCommand, info_commands::InfoCommand, query_commands::QueryCommand,
+    transfer_commands::TransferCommand,
 };
 use anyhow::Error;
-use libra_metrics::counters::*;
-use libra_types::{account_address::AccountAddress, transaction::authenticator::AuthenticationKey};
+use diem_types::{account_address::AccountAddress, transaction::authenticator::AuthenticationKey};
 use std::{collections::HashMap, sync::Arc};
 
 /// Print the error and bump up error counter.
@@ -26,12 +26,12 @@ pub fn debug_format_cmd(cmd: &str) -> bool {
     cmd.ends_with('?')
 }
 
-/// Check whether the input string is a valid libra address.
+/// Check whether the input string is a valid diem address.
 pub fn is_address(data: &str) -> bool {
     hex::decode(data).map_or(false, |vec| vec.len() == AccountAddress::LENGTH)
 }
 
-/// Check whether the input string is a valid libra authentication key.
+/// Check whether the input string is a valid diem authentication key.
 pub fn is_authentication_key(data: &str) -> bool {
     hex::decode(data).map_or(false, |vec| vec.len() == AuthenticationKey::LENGTH)
 }

@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Protocol used to exchange supported protocol information with a remote.
@@ -18,7 +18,7 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     // Send serialized handshake message to remote peer.
-    let msg = lcs::to_bytes(own_handshake).map_err(|e| {
+    let msg = bcs::to_bytes(own_handshake).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Failed to serialize identity msg: {}", e),
@@ -30,7 +30,7 @@ where
     // Read handshake message from the Remote
     let mut response = BytesMut::new();
     read_u16frame(socket, &mut response).await?;
-    let identity = lcs::from_bytes(&response).map_err(|e| {
+    let identity = bcs::from_bytes(&response).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Failed to parse identity msg: {}", e),
@@ -48,10 +48,11 @@ mod tests {
         },
         ProtocolId,
     };
+    use diem_config::network_id::NetworkId;
+    use diem_types::chain_id::ChainId;
     use futures::{executor::block_on, future::join};
-    use libra_config::network_id::NetworkId;
-    use libra_types::chain_id::ChainId;
     use memsocket::MemorySocket;
+    use std::collections::BTreeMap;
 
     fn build_test_connection() -> (MemorySocket, MemorySocket) {
         MemorySocket::new_pair()
@@ -64,8 +65,8 @@ mod tests {
         let (mut outbound, mut inbound) = build_test_connection();
 
         // Create client and server handshake messages.
-        let mut server_handshake = HandshakeMsg::new(chain_id, network_id.clone());
-        server_handshake.add(
+        let mut supported_protocols = BTreeMap::new();
+        supported_protocols.insert(
             MessagingProtocolVersion::V1,
             [
                 ProtocolId::ConsensusDirectSend,
@@ -74,13 +75,23 @@ mod tests {
             .iter()
             .into(),
         );
-        let mut client_handshake = HandshakeMsg::new(chain_id, network_id);
-        client_handshake.add(
+        let server_handshake = HandshakeMsg {
+            chain_id,
+            network_id: network_id.clone(),
+            supported_protocols,
+        };
+        let mut supported_protocols = BTreeMap::new();
+        supported_protocols.insert(
             MessagingProtocolVersion::V1,
             [ProtocolId::ConsensusRpc, ProtocolId::ConsensusDirectSend]
                 .iter()
                 .into(),
         );
+        let client_handshake = HandshakeMsg {
+            chain_id,
+            network_id,
+            supported_protocols,
+        };
 
         let server_handshake_clone = server_handshake.clone();
         let client_handshake_clone = client_handshake.clone();
@@ -91,8 +102,8 @@ mod tests {
                 .expect("Handshake fails");
 
             assert_eq!(
-                lcs::to_bytes(&handshake).unwrap(),
-                lcs::to_bytes(&client_handshake_clone).unwrap()
+                bcs::to_bytes(&handshake).unwrap(),
+                bcs::to_bytes(&client_handshake_clone).unwrap()
             );
         };
 
@@ -102,9 +113,75 @@ mod tests {
                 .expect("Handshake fails");
 
             assert_eq!(
-                lcs::to_bytes(&handshake).unwrap(),
-                lcs::to_bytes(&server_handshake_clone).unwrap()
+                bcs::to_bytes(&handshake).unwrap(),
+                bcs::to_bytes(&server_handshake_clone).unwrap()
             );
+        };
+
+        block_on(join(server, client));
+    }
+
+    #[test]
+    fn handshake_chain_id_mismatch() {
+        let (mut outbound, mut inbound) = MemorySocket::new_pair();
+
+        // server state
+        let server_handshake = HandshakeMsg::new_for_testing();
+
+        // client state
+        let mut client_handshake = server_handshake.clone();
+        client_handshake.chain_id = ChainId::new(client_handshake.chain_id.id() + 1);
+
+        // perform the handshake negotiation
+        let server = async move {
+            let remote_handshake = exchange_handshake(&server_handshake, &mut inbound)
+                .await
+                .unwrap();
+            server_handshake
+                .perform_handshake(&remote_handshake)
+                .unwrap_err()
+        };
+
+        let client = async move {
+            let remote_handshake = exchange_handshake(&client_handshake, &mut outbound)
+                .await
+                .unwrap();
+            client_handshake
+                .perform_handshake(&remote_handshake)
+                .unwrap_err()
+        };
+
+        block_on(join(server, client));
+    }
+
+    #[test]
+    fn handshake_network_id_mismatch() {
+        let (mut outbound, mut inbound) = MemorySocket::new_pair();
+
+        // server state
+        let server_handshake = HandshakeMsg::new_for_testing();
+
+        // client state
+        let mut client_handshake = server_handshake.clone();
+        client_handshake.network_id = NetworkId::Public;
+
+        // perform the handshake negotiation
+        let server = async move {
+            let remote_handshake = exchange_handshake(&server_handshake, &mut inbound)
+                .await
+                .unwrap();
+            server_handshake
+                .perform_handshake(&remote_handshake)
+                .unwrap_err()
+        };
+
+        let client = async move {
+            let remote_handshake = exchange_handshake(&client_handshake, &mut outbound)
+                .await
+                .unwrap();
+            client_handshake
+                .perform_handshake(&remote_handshake)
+                .unwrap_err()
         };
 
         block_on(join(server, client));

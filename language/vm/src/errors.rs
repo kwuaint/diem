@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -67,7 +67,7 @@ impl VMError {
                 if major_status.status_type() == StatusType::Execution =>
             {
                 debug_assert!(
-                    major_status.should_skip_checks_for_todo() || offsets.len() == 1,
+                    offsets.len() == 1,
                     "Unexpected offsets. major_status: {:?}\
                     sub_status: {:?}\
                     location: {:?}\
@@ -81,13 +81,11 @@ impl VMError {
                     Location::Script => vm_status::AbortLocation::Script,
                     Location::Module(id) => vm_status::AbortLocation::Module(id),
                     Location::Undefined => {
-                        debug_assert!(major_status.should_skip_checks_for_todo());
                         return VMStatus::Error(major_status);
                     }
                 };
                 let (function, code_offset) = match offsets.pop() {
                     None => {
-                        debug_assert!(major_status.should_skip_checks_for_todo());
                         return VMStatus::Error(major_status);
                     }
                     Some((fdef_idx, code_offset)) => (fdef_idx.0, code_offset),
@@ -171,6 +169,25 @@ pub struct PartialVMError {
 }
 
 impl PartialVMError {
+    pub fn all_data(
+        self,
+    ) -> (
+        StatusCode,
+        Option<u64>,
+        Option<String>,
+        Vec<(IndexKind, TableIndex)>,
+        Vec<(FunctionDefinitionIndex, CodeOffset)>,
+    ) {
+        let PartialVMError {
+            major_status,
+            sub_status,
+            message,
+            indices,
+            offsets,
+        } = self;
+        (major_status, sub_status, message, indices, offsets)
+    }
+
     pub fn finish(self, location: Location) -> VMError {
         let PartialVMError {
             major_status,

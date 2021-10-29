@@ -1,31 +1,34 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use language_e2e_tests::{
-    account::{self, Account},
-    executor::FakeExecutor,
-    gas_costs::TXN_RESERVED,
-    transaction_status_eq,
-};
-use libra_types::{
+use diem_types::{
     account_config,
     transaction::TransactionStatus,
     vm_status::{known_locations, KeptVMStatus},
+};
+use language_e2e_tests::{
+    account::{self, Account},
+    current_function_name,
+    executor::FakeExecutor,
+    gas_costs::TXN_RESERVED,
+    transaction_status_eq,
 };
 use transaction_builder::*;
 
 #[test]
 fn tiered_mint_designated_dealer() {
     let mut executor = FakeExecutor::from_genesis_file();
+    executor.set_golden_file(current_function_name!());
+
     let blessed = Account::new_blessed_tc();
 
     // account to represent designated dealer
-    let dd = Account::new();
+    let dd = executor.create_raw_account();
     executor.execute_and_apply(
         blessed
             .transaction()
             .script(encode_create_designated_dealer_script(
-                account_config::coin1_tag(),
+                account_config::xus_tag(),
                 0,
                 *dd.address(),
                 dd.auth_key_prefix(),
@@ -41,7 +44,7 @@ fn tiered_mint_designated_dealer() {
         blessed
             .transaction()
             .script(encode_tiered_mint_script(
-                account_config::coin1_tag(),
+                account_config::xus_tag(),
                 1,
                 *dd.address(),
                 mint_amount_one,
@@ -54,7 +57,7 @@ fn tiered_mint_designated_dealer() {
         .read_account_resource(&dd)
         .expect("receiver must exist");
     let dd_balance = executor
-        .read_balance_resource(&dd, account::coin1_currency_code())
+        .read_balance_resource(&dd, account::xus_currency_code())
         .expect("receiver balance must exist");
     assert_eq!(mint_amount_one, dd_balance.coin());
     assert_eq!(0, dd_post_mint.sequence_number());
@@ -66,7 +69,7 @@ fn tiered_mint_designated_dealer() {
         blessed
             .transaction()
             .script(encode_tiered_mint_script(
-                account_config::coin1_tag(),
+                account_config::xus_tag(),
                 2,
                 *dd.address(),
                 mint_amount_two,
@@ -76,7 +79,7 @@ fn tiered_mint_designated_dealer() {
             .sign(),
     );
     let dd_balance = executor
-        .read_balance_resource(&dd, account::coin1_currency_code())
+        .read_balance_resource(&dd, account::xus_currency_code())
         .expect("receiver balance must exist");
     assert_eq!(mint_amount_one + mint_amount_two, dd_balance.coin());
 
@@ -86,7 +89,7 @@ fn tiered_mint_designated_dealer() {
         blessed
             .transaction()
             .script(encode_tiered_mint_script(
-                account_config::coin1_tag(),
+                account_config::xus_tag(),
                 3,
                 *dd.address(),
                 mint_amount_one,
@@ -110,38 +113,40 @@ fn mint_to_existing_not_dd() {
     // We can't run mint test on terraform genesis as we don't have the private key to sign the
     // mint transaction.
     let mut executor = FakeExecutor::from_genesis_file();
-    let tc = Account::new_blessed_tc();
-    let libra_root = Account::new_libra_root();
+    executor.set_golden_file(current_function_name!());
+
+    let blessed = Account::new_blessed_tc();
 
     // create and publish a sender with 1_000_000 coins
-    let receiver = Account::new();
+    let receiver = executor.create_raw_account();
 
     executor.execute_and_apply(
-        libra_root
+        blessed
             .transaction()
             .script(encode_create_parent_vasp_account_script(
-                account_config::coin1_tag(),
+                account_config::xus_tag(),
                 0,
                 *receiver.address(),
                 receiver.auth_key_prefix(),
                 vec![],
                 false,
             ))
-            .sequence_number(1)
+            .sequence_number(0)
             .sign(),
     );
 
     let mint_amount = 1_000;
     let output = executor.execute_transaction(
-        tc.transaction()
+        blessed
+            .transaction()
             .script(encode_tiered_mint_script(
-                account_config::coin1_tag(),
+                account_config::xus_tag(),
                 0,
                 *receiver.address(),
                 mint_amount,
                 4,
             ))
-            .sequence_number(0)
+            .sequence_number(1)
             .sign(),
     );
     assert_eq!(
@@ -159,17 +164,19 @@ fn mint_to_new_account() {
     // We can't run mint test on terraform genesis as we don't have the private key to sign the
     // mint transaction.
 
-    let executor = FakeExecutor::from_genesis_file();
+    let mut executor = FakeExecutor::from_genesis_file();
+    executor.set_golden_file(current_function_name!());
+
     let tc = Account::new_blessed_tc();
 
     // create and publish a sender with TXN_RESERVED coins
-    let new_account = Account::new();
+    let new_account = executor.create_raw_account();
 
     let mint_amount = TXN_RESERVED;
     let output = executor.execute_transaction(
         tc.transaction()
             .script(encode_tiered_mint_script(
-                account_config::coin1_tag(),
+                account_config::xus_tag(),
                 0,
                 *new_account.address(),
                 mint_amount,
@@ -191,14 +198,16 @@ fn mint_to_new_account() {
 #[test]
 fn tiered_update_exchange_rate() {
     let mut executor = FakeExecutor::from_genesis_file();
+    executor.set_golden_file(current_function_name!());
+
     let blessed = Account::new_blessed_tc();
 
-    // set coin1 rate to 1.23 COIN1
+    // set xus rate to 1.23 XUS
     executor.execute_and_apply(
         blessed
             .transaction()
             .script(encode_update_exchange_rate_script(
-                account_config::coin1_tag(),
+                account_config::xus_tag(),
                 0,
                 123,
                 100,

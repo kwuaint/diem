@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! In a leader based consensus algorithm, each participant maintains a block tree that looks like
@@ -17,18 +17,22 @@
 #[cfg(test)]
 mod test;
 
-use crate::types::ProcessedVMOutput;
+use crate::{
+    logging::{LogEntry, LogSchema},
+    types::ProcessedVMOutput,
+};
 use anyhow::{format_err, Result};
 use consensus_types::block::Block;
-use executor_types::{Error, ExecutedTrees};
-use libra_crypto::{hash::PRE_GENESIS_BLOCK_ID, HashValue};
-use libra_logger::prelude::*;
-use libra_types::{
+use diem_crypto::{hash::PRE_GENESIS_BLOCK_ID, HashValue};
+use diem_infallible::Mutex;
+use diem_logger::prelude::*;
+use diem_types::{
     contract_event::ContractEvent, ledger_info::LedgerInfo, transaction::Transaction,
 };
+use executor_types::{Error, ExecutedTrees};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Weak},
 };
 use storage_interface::{StartupInfo, TreeState};
 
@@ -90,10 +94,12 @@ impl Drop for SpeculationBlock {
     fn drop(&mut self) {
         self.block_map
             .lock()
-            .unwrap()
             .remove(&self.id())
             .expect("Speculation block must exist in block_map before being dropped.");
-        debug!("Speculation block {} is dropped.", self.id())
+        debug!(
+            LogSchema::new(LogEntry::SpeculationCache).block_id(self.id()),
+            "Block dropped"
+        );
     }
 }
 
@@ -184,15 +190,19 @@ impl SpeculationCache {
             // Update the root block id with reconfig virtual block id, to be consistent
             // with the logic of Consensus.
             let id = Block::make_genesis_block_from_ledger_info(committed_ledger_info).id();
-            debug!(
-                "Updated with a new root block {} as a virtual block of reconfiguration block {}",
-                id,
-                committed_ledger_info.consensus_block_id()
+            info!(
+                LogSchema::new(LogEntry::SpeculationCache)
+                    .root_block_id(id)
+                    .original_reconfiguration_block_id(committed_ledger_info.consensus_block_id()),
+                "Updated with a new root block as a virtual block of reconfiguration block"
             );
             id
         } else {
             let id = committed_ledger_info.consensus_block_id();
-            debug!("updated with a new root block {}", id);
+            info!(
+                LogSchema::new(LogEntry::SpeculationCache).root_block_id(id),
+                "Updated with a new root block",
+            );
             id
         };
         self.committed_block_id = new_root_block_id;
@@ -207,7 +217,7 @@ impl SpeculationCache {
 
     pub fn reset(&mut self) {
         self.heads = vec![];
-        *self.block_map.lock().unwrap() = HashMap::new();
+        *self.block_map.lock() = HashMap::new();
     }
 
     pub fn add_block(
@@ -226,7 +236,6 @@ impl SpeculationCache {
         let old_block = self
             .block_map
             .lock()
-            .unwrap()
             .get(&block_id)
             .map(|b| {
                 b.upgrade().ok_or_else(|| {
@@ -239,7 +248,7 @@ impl SpeculationCache {
             .transpose()?;
 
         if let Some(old_block) = old_block {
-            old_block.lock().unwrap().replace(txns, output);
+            old_block.lock().replace(txns, output);
             return Ok(());
         }
 
@@ -252,7 +261,6 @@ impl SpeculationCache {
         // Add to the map
         self.block_map
             .lock()
-            .unwrap()
             .insert(block_id, Arc::downgrade(&new_block));
         // Add to the tree
         if parent_block_id == self.committed_block_id() {
@@ -260,7 +268,6 @@ impl SpeculationCache {
         } else {
             self.get_block(&parent_block_id)?
                 .lock()
-                .unwrap()
                 .add_child(new_block);
         }
         Ok(())
@@ -274,7 +281,7 @@ impl SpeculationCache {
     ) -> Result<(), Error> {
         let arc_latest_committed_block =
             self.get_block(&committed_ledger_info.consensus_block_id())?;
-        let latest_committed_block = arc_latest_committed_block.lock().unwrap();
+        let latest_committed_block = arc_latest_committed_block.lock();
         self.heads = latest_committed_block.children.clone();
         self.update_block_tree_root(
             latest_committed_block.output().executed_trees().clone(),
@@ -290,7 +297,6 @@ impl SpeculationCache {
         Ok(self
             .block_map
             .lock()
-            .unwrap()
             .get(&block_id)
             .ok_or_else(|| Error::BlockNotFound(*block_id))?
             .upgrade()

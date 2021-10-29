@@ -1,18 +1,20 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{account_address::AccountAddress, on_chain_config::ValidatorSet};
-use anyhow::{ensure, Result};
-use libra_crypto::{
+use diem_crypto::{
     ed25519::{Ed25519PublicKey, Ed25519Signature},
     hash::CryptoHash,
     Signature, VerifyingKey,
 };
-#[cfg(any(test, feature = "fuzzing"))]
-use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt};
 use thiserror::Error;
+
+#[cfg(any(test, feature = "fuzzing"))]
+use anyhow::{ensure, Result};
+#[cfg(any(test, feature = "fuzzing"))]
+use proptest_derive::Arbitrary;
 
 /// Errors possible during signature verification.
 #[derive(Debug, Error, PartialEq)]
@@ -113,6 +115,21 @@ impl ValidatorVerifier {
             quorum_voting_power,
             total_voting_power,
         })
+    }
+
+    /// Initializes a validator verifier with a specified quorum voting power and total power.
+    #[cfg(any(test, feature = "fuzzing"))]
+    // This method should only used by tests and fuzzers to produce an arbitrary ValidatorVerifier.
+    pub fn new_for_testing(
+        address_to_validator_info: BTreeMap<AccountAddress, ValidatorConsensusInfo>,
+        quorum_voting_power: u64,
+        total_voting_power: u64,
+    ) -> Self {
+        ValidatorVerifier {
+            address_to_validator_info,
+            quorum_voting_power,
+            total_voting_power,
+        }
     }
 
     /// Helper method to initialize with a single author and public key with quorum voting power 1.
@@ -275,7 +292,7 @@ impl fmt::Display for ValidatorVerifier {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
         write!(f, "ValidatorSet: [")?;
         for (addr, info) in &self.address_to_validator_info {
-            write!(f, "{}: {}, ", addr.short_str(), info.voting_power)?;
+            write!(f, "{}: {}, ", addr.short_str_lossless(), info.voting_power)?;
         }
         write!(f, "]")
     }
@@ -360,7 +377,7 @@ pub fn random_validator_verifier(
 mod tests {
     use super::*;
     use crate::validator_signer::ValidatorSigner;
-    use libra_crypto::test_utils::{TestLibraCrypto, TEST_SEED};
+    use diem_crypto::test_utils::{TestDiemCrypto, TEST_SEED};
     use std::collections::BTreeMap;
 
     #[test]
@@ -378,7 +395,7 @@ mod tests {
             }
         );
 
-        let dummy_struct = TestLibraCrypto("Hello, World".to_string());
+        let dummy_struct = TestDiemCrypto("Hello, World".to_string());
         for validator in validator_signers.iter() {
             author_to_signature_map.insert(validator.author(), validator.sign(&dummy_struct));
         }
@@ -392,7 +409,7 @@ mod tests {
     #[test]
     fn test_validator() {
         let validator_signer = ValidatorSigner::random(TEST_SEED);
-        let dummy_struct = TestLibraCrypto("Hello, World".to_string());
+        let dummy_struct = TestDiemCrypto("Hello, World".to_string());
         let signature = validator_signer.sign(&dummy_struct);
         let validator =
             ValidatorVerifier::new_single(validator_signer.author(), validator_signer.public_key());
@@ -423,7 +440,7 @@ mod tests {
         let validator_signers: Vec<ValidatorSigner> = (0..NUM_SIGNERS)
             .map(|i| ValidatorSigner::random([i; 32]))
             .collect();
-        let dummy_struct = TestLibraCrypto("Hello, World".to_string());
+        let dummy_struct = TestDiemCrypto("Hello, World".to_string());
 
         // Create a map from authors to public keys with equal voting power.
         let mut author_to_public_key_map = BTreeMap::new();
@@ -519,7 +536,7 @@ mod tests {
         let validator_signers: Vec<ValidatorSigner> = (0..NUM_SIGNERS)
             .map(|i| ValidatorSigner::random([i; 32]))
             .collect();
-        let dummy_struct = TestLibraCrypto("Hello, World".to_string());
+        let dummy_struct = TestDiemCrypto("Hello, World".to_string());
 
         // Create a map from authors to public keys with increasing weights (0, 1, 2, 3) and
         // a map of author to signature.
@@ -551,7 +568,7 @@ mod tests {
         let validator_signers: Vec<ValidatorSigner> = (0..NUM_SIGNERS)
             .map(|i| ValidatorSigner::random([i; 32]))
             .collect();
-        let dummy_struct = TestLibraCrypto("Hello, World".to_string());
+        let dummy_struct = TestDiemCrypto("Hello, World".to_string());
 
         // Create a map from authors to public keys with increasing weights (0, 1, 2, 3) and
         // a map of author to signature.

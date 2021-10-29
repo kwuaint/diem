@@ -1,10 +1,11 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use diem_infallible::{duration_since_epoch, Mutex};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, value as json};
-use std::{collections::VecDeque, convert::TryInto, sync::Mutex, time::SystemTime};
+use std::{collections::VecDeque, convert::TryInto};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct JsonLogEntry {
@@ -36,9 +37,7 @@ static JSON_LOG_ENTRY_QUEUE: Lazy<Mutex<VecDeque<JsonLogEntry>>> =
 
 impl JsonLogEntry {
     pub fn new(name: &'static str, json: json::Value) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("now > UNIX_EPOCH")
+        let timestamp = duration_since_epoch()
             .as_millis()
             .try_into()
             .expect("Unable to convert u128 into u64");
@@ -57,7 +56,7 @@ impl JsonLogEntry {
 /// will contend for same lock.
 // TODO: if we use events more often we should rewrite it to be non-blocking
 pub fn send_json_log(entry: JsonLogEntry) {
-    let mut queue = JSON_LOG_ENTRY_QUEUE.lock().unwrap();
+    let mut queue = JSON_LOG_ENTRY_QUEUE.lock();
     if queue.len() >= MAX_EVENTS_IN_QUEUE {
         queue.pop_front();
     }
@@ -66,6 +65,6 @@ pub fn send_json_log(entry: JsonLogEntry) {
 
 /// Get up to MAX_EVENTS_IN_QUEUE last events and clears the queue
 pub fn pop_last_entries() -> Vec<JsonLogEntry> {
-    let mut queue = JSON_LOG_ENTRY_QUEUE.lock().unwrap();
+    let mut queue = JSON_LOG_ENTRY_QUEUE.lock();
     queue.drain(..).collect()
 }

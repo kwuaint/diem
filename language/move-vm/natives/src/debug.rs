@@ -1,7 +1,7 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use move_core_types::gas_schedule::ZERO_GAS_UNITS;
+use move_core_types::gas_schedule::ONE_GAS_UNIT;
 #[allow(unused_imports)]
 use move_vm_types::values::{values_impl::debug::print_reference, Reference};
 use move_vm_types::{
@@ -9,6 +9,7 @@ use move_vm_types::{
     natives::function::{NativeContext, NativeResult},
     values::Value,
 };
+use smallvec::smallvec;
 use std::collections::VecDeque;
 use vm::errors::PartialVMResult;
 
@@ -33,7 +34,7 @@ pub fn native_print(
         println!("[debug] {}", buf);
     }
 
-    Ok(NativeResult::ok(ZERO_GAS_UNITS, vec![]))
+    Ok(NativeResult::ok(ONE_GAS_UNIT, smallvec![]))
 }
 
 #[allow(unused_variables)]
@@ -52,5 +53,5 @@ pub fn native_print_stack_trace(
         println!("{}", s);
     }
 
-    Ok(NativeResult::ok(ZERO_GAS_UNITS, vec![]))
+    Ok(NativeResult::ok(ONE_GAS_UNIT, smallvec![]))
 }

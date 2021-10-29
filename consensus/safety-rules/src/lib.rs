@@ -1,8 +1,9 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
+mod configurable_validator_signer;
 mod consensus_state;
 mod counters;
 mod error;
@@ -24,8 +25,13 @@ pub use crate::{
     t_safety_rules::TSafetyRules,
 };
 
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod fuzzing_utils;
+
+#[cfg(any(test, feature = "fuzzing"))]
+pub use crate::fuzzing_utils::fuzzing;
+
 #[cfg(any(test, feature = "testing"))]
-#[path = "test_utils.rs"]
 pub mod test_utils;
 
 #[cfg(test)]

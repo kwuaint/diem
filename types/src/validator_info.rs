@@ -1,22 +1,16 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{account_address::AccountAddress, validator_config::ValidatorConfig};
 #[cfg(any(test, feature = "fuzzing"))]
-use libra_crypto::Uniform;
-use libra_crypto::{ed25519::Ed25519PublicKey, x25519};
-#[cfg(any(test, feature = "fuzzing"))]
-use libra_network_address::{
-    encrypted::{
-        RawEncNetworkAddress, TEST_SHARED_VAL_NETADDR_KEY, TEST_SHARED_VAL_NETADDR_KEY_VERSION,
-    },
-    NetworkAddress, RawNetworkAddress,
+use crate::network_address::{
+    encrypted::{TEST_SHARED_VAL_NETADDR_KEY, TEST_SHARED_VAL_NETADDR_KEY_VERSION},
+    NetworkAddress,
 };
+use crate::{account_address::AccountAddress, validator_config::ValidatorConfig};
+use diem_crypto::ed25519::Ed25519PublicKey;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
-#[cfg(any(test, feature = "fuzzing"))]
-use std::convert::TryFrom;
 use std::fmt;
 
 /// After executing a special transaction indicates a change to the next epoch, consensus
@@ -35,11 +29,18 @@ pub struct ValidatorInfo {
     consensus_voting_power: u64,
     // Validator config
     config: ValidatorConfig,
+    // The time of last recofiguration invoked by this validator
+    // in microseconds
+    last_config_update_time: u64,
 }
 
 impl fmt::Display for ValidatorInfo {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(f, "account_address: {}", self.account_address.short_str())
+        write!(
+            f,
+            "account_address: {}",
+            self.account_address.short_str_lossless()
+        )
     }
 }
 
@@ -53,6 +54,7 @@ impl ValidatorInfo {
             account_address,
             consensus_voting_power,
             config,
+            last_config_update_time: 0,
         }
     }
 
@@ -62,35 +64,25 @@ impl ValidatorInfo {
         consensus_public_key: Ed25519PublicKey,
         consensus_voting_power: u64,
     ) -> Self {
-        let private_key = x25519::PrivateKey::generate_for_testing();
-        let validator_network_identity_public_key = private_key.public_key();
-
         let addr = NetworkAddress::mock();
-        let raw_addr = RawNetworkAddress::try_from(&addr).unwrap();
-        let enc_addr = raw_addr.encrypt(
+        let enc_addr = addr.clone().encrypt(
             &TEST_SHARED_VAL_NETADDR_KEY,
             TEST_SHARED_VAL_NETADDR_KEY_VERSION,
             &account_address,
             0,
             0,
         );
-        let validator_network_address = RawEncNetworkAddress::try_from(&enc_addr).unwrap();
-
-        let private_key = x25519::PrivateKey::generate_for_testing();
-        let full_node_network_identity_public_key = private_key.public_key();
-        let full_node_network_address = RawNetworkAddress::try_from(&addr).unwrap();
         let config = ValidatorConfig::new(
             consensus_public_key,
-            validator_network_identity_public_key,
-            validator_network_address,
-            full_node_network_identity_public_key,
-            full_node_network_address,
+            bcs::to_bytes(&vec![enc_addr.unwrap()]).unwrap(),
+            bcs::to_bytes(&vec![addr]).unwrap(),
         );
 
         Self {
             account_address,
             consensus_voting_power,
             config,
+            last_config_update_time: 0,
         }
     }
 
@@ -108,11 +100,6 @@ impl ValidatorInfo {
     /// Returns the voting power for this validator
     pub fn consensus_voting_power(&self) -> u64 {
         self.consensus_voting_power
-    }
-
-    /// Returns the key that establishes a validator's identity in the p2p network
-    pub fn network_identity_public_key(&self) -> x25519::PublicKey {
-        self.config.validator_network_identity_public_key
     }
 
     /// Returns the validator's config

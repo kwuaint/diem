@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module lays out the basic abstract costing schedule for bytecode instructions.
@@ -120,7 +120,13 @@ define_gas_unit! {
 define_gas_unit! {
     name: GasUnits,
     carrier: GasCarrier,
-    doc: "A newtype wrapper around the underlying carrier for the gas cost."
+    doc: "Units of gas as seen by clients of the Move VM."
+}
+
+define_gas_unit! {
+    name: InternalGasUnits,
+    carrier: GasCarrier,
+    doc: "Units of gas used within the Move VM, scaled for fine-grained accounting."
 }
 
 define_gas_unit! {
@@ -129,23 +135,20 @@ define_gas_unit! {
     doc: "A newtype wrapper around the gas price for each unit of gas consumed."
 }
 
-/// Zero cost.
-pub const ZERO_GAS_UNITS: GasUnits<GasCarrier> = GasUnits(0);
+/// One unit of gas
+pub const ONE_GAS_UNIT: InternalGasUnits<GasCarrier> = InternalGasUnits(1);
 
 /// The maximum size representable by AbstractMemorySize
 pub const MAX_ABSTRACT_MEMORY_SIZE: AbstractMemorySize<GasCarrier> =
     AbstractMemorySize(std::u64::MAX);
 
-/// The word size that we charge by
-pub const WORD_SIZE: AbstractMemorySize<GasCarrier> = AbstractMemorySize(8);
-
-/// The size in words for a non-string or address constant on the stack
+/// The size in bytes for a non-string or address constant on the stack
 pub const CONST_SIZE: AbstractMemorySize<GasCarrier> = AbstractMemorySize(16);
 
-/// The size in words for a reference on the stack
+/// The size in bytes for a reference on the stack
 pub const REFERENCE_SIZE: AbstractMemorySize<GasCarrier> = AbstractMemorySize(8);
 
-/// The size of a struct in words
+/// The size of a struct in bytes
 pub const STRUCT_SIZE: AbstractMemorySize<GasCarrier> = AbstractMemorySize(2);
 
 /// For V1 all accounts will be ~800 bytes
@@ -154,25 +157,32 @@ pub const DEFAULT_ACCOUNT_SIZE: AbstractMemorySize<GasCarrier> = AbstractMemoryS
 /// Any transaction over this size will be charged `INTRINSIC_GAS_PER_BYTE` per byte
 pub const LARGE_TRANSACTION_CUTOFF: AbstractMemorySize<GasCarrier> = AbstractMemorySize(600);
 
+/// For exists checks on data that doesn't exists this is the multiplier that is used.
+pub const MIN_EXISTS_DATA_SIZE: AbstractMemorySize<GasCarrier> = AbstractMemorySize(100);
+
+pub const MAX_TRANSACTION_SIZE_IN_BYTES: GasCarrier = 4096;
+
 #[derive(Clone, Debug, Serialize, PartialEq, Deserialize)]
 pub struct GasConstants {
     /// The cost per-byte read from global storage.
-    pub global_memory_per_byte_cost: GasUnits<GasCarrier>,
+    pub global_memory_per_byte_cost: InternalGasUnits<GasCarrier>,
 
     /// The cost per-byte written to storage.
-    pub global_memory_per_byte_write_cost: GasUnits<GasCarrier>,
+    pub global_memory_per_byte_write_cost: InternalGasUnits<GasCarrier>,
 
-    /// We charge one unit of gas per-byte for the first 600 bytes
-    pub min_transaction_gas_units: GasUnits<GasCarrier>,
+    /// The flat minimum amount of gas required for any transaction.
+    /// Charged at the start of execution.
+    pub min_transaction_gas_units: InternalGasUnits<GasCarrier>,
 
-    /// Any transaction over this size will be charged `INTRINSIC_GAS_PER_BYTE` per byte
+    /// Any transaction over this size will be charged an additional amount per byte.
     pub large_transaction_cutoff: AbstractMemorySize<GasCarrier>,
 
-    /// The units of gas that should be charged per byte for every transaction.
-    pub instrinsic_gas_per_byte: GasUnits<GasCarrier>,
+    /// The units of gas that to be charged per byte over the `large_transaction_cutoff` in addition to
+    /// `min_transaction_gas_units` for transactions whose size exceeds `large_transaction_cutoff`.
+    pub intrinsic_gas_per_byte: InternalGasUnits<GasCarrier>,
 
-    /// ~5000 nanoseconds should equal one unit of computational gas. We bound the maximum
-    /// computational time of any given transaction at  20 seconds. We want this number and
+    /// ~5 microseconds should equal one unit of computational gas. We bound the maximum
+    /// computational time of any given transaction at roughly 20 seconds. We want this number and
     /// `MAX_PRICE_PER_GAS_UNIT` to always satisfy the inequality that
     /// MAXIMUM_NUMBER_OF_GAS_UNITS * MAX_PRICE_PER_GAS_UNIT < min(u64::MAX, GasUnits<GasCarrier>::MAX)
     /// NB: The bound is set quite high since custom scripts aren't allowed except from predefined
@@ -191,18 +201,28 @@ pub struct GasConstants {
     pub default_account_size: AbstractMemorySize<GasCarrier>,
 }
 
+impl GasConstants {
+    pub fn to_internal_units(&self, units: GasUnits<GasCarrier>) -> InternalGasUnits<GasCarrier> {
+        InternalGasUnits::new(units.get() * self.gas_unit_scaling_factor)
+    }
+
+    pub fn to_external_units(&self, units: InternalGasUnits<GasCarrier>) -> GasUnits<GasCarrier> {
+        GasUnits::new(units.get() / self.gas_unit_scaling_factor)
+    }
+}
+
 impl Default for GasConstants {
     fn default() -> Self {
         Self {
-            global_memory_per_byte_cost: GasUnits(2),
-            global_memory_per_byte_write_cost: GasUnits(5),
-            min_transaction_gas_units: GasUnits(600),
+            global_memory_per_byte_cost: InternalGasUnits(4),
+            global_memory_per_byte_write_cost: InternalGasUnits(9),
+            min_transaction_gas_units: InternalGasUnits(600),
             large_transaction_cutoff: LARGE_TRANSACTION_CUTOFF,
-            instrinsic_gas_per_byte: GasUnits(8),
+            intrinsic_gas_per_byte: InternalGasUnits(8),
             maximum_number_of_gas_units: GasUnits(4_000_000),
             min_price_per_gas_unit: GasPrice(0),
             max_price_per_gas_unit: GasPrice(10_000),
-            max_transaction_size_in_bytes: 4096,
+            max_transaction_size_in_bytes: MAX_TRANSACTION_SIZE_IN_BYTES,
             gas_unit_scaling_factor: 1000,
             default_account_size: DEFAULT_ACCOUNT_SIZE,
         }
@@ -237,37 +257,21 @@ impl CostTable {
 /// - memory cost: how much memory is required for the instruction, and storage overhead
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct GasCost {
-    pub instruction_gas: GasUnits<GasCarrier>,
-    pub memory_gas: GasUnits<GasCarrier>,
+    pub instruction_gas: InternalGasUnits<GasCarrier>,
+    pub memory_gas: InternalGasUnits<GasCarrier>,
 }
 
 impl GasCost {
     pub fn new(instr_gas: GasCarrier, mem_gas: GasCarrier) -> Self {
         Self {
-            instruction_gas: GasUnits::new(instr_gas),
-            memory_gas: GasUnits::new(mem_gas),
+            instruction_gas: InternalGasUnits::new(instr_gas),
+            memory_gas: InternalGasUnits::new(mem_gas),
         }
     }
 
-    /// Take a GasCost from our gas schedule and convert it to a total gas charge in `GasUnits`.
-    ///
-    /// This is used internally for converting from a `GasCost` which is a triple of numbers
-    /// represeing instruction, stack, and memory consumption into a number of `GasUnits`.
+    /// Convert a GasCost to a total gas charge in `InternalGasUnits`.
     #[inline]
-    pub fn total(&self) -> GasUnits<GasCarrier> {
+    pub fn total(&self) -> InternalGasUnits<GasCarrier> {
         self.instruction_gas.add(self.memory_gas)
     }
-}
-
-/// Computes the number of words rounded up
-pub fn words_in(size: AbstractMemorySize<GasCarrier>) -> AbstractMemorySize<GasCarrier> {
-    precondition!(size.get() <= MAX_ABSTRACT_MEMORY_SIZE.get() - (WORD_SIZE.get() + 1));
-    // round-up div truncate
-    size.map2(WORD_SIZE, |size, word_size| {
-        // static invariant
-        assume!(word_size > 0);
-        // follows from the precondition
-        assume!(size <= u64::max_value() - word_size);
-        (size + (word_size - 1)) / word_size
-    })
 }

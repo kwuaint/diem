@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -8,23 +8,17 @@ use crate::{
     transaction::build_raw_transaction,
 };
 use core::str::FromStr;
-use libra_config::config::HANDSHAKE_VERSION;
-use libra_crypto::ValidCryptoMaterial;
-use libra_global_constants::{
+use diem_config::config::HANDSHAKE_VERSION;
+use diem_global_constants::{
     CONSENSUS_KEY, FULLNODE_NETWORK_KEY, OPERATOR_ACCOUNT, OPERATOR_KEY, OWNER_ACCOUNT,
     VALIDATOR_NETWORK_KEY,
 };
-use libra_network_address::{
-    encrypted::{
-        RawEncNetworkAddress, TEST_SHARED_VAL_NETADDR_KEY, TEST_SHARED_VAL_NETADDR_KEY_VERSION,
-    },
-    NetworkAddress, Protocol, RawNetworkAddress,
+use diem_types::{
+    chain_id::ChainId,
+    network_address::{NetworkAddress, Protocol},
+    transaction::Transaction,
 };
-use libra_types::{chain_id::ChainId, transaction::Transaction};
-use std::{
-    convert::TryFrom,
-    net::{Ipv4Addr, ToSocketAddrs},
-};
+use std::net::{Ipv4Addr, ToSocketAddrs};
 use structopt::StructOpt;
 
 #[derive(Clone, Debug, StructOpt)]
@@ -51,7 +45,14 @@ impl ValidatorConfig {
         fullnode_address: NetworkAddress,
         validator_address: NetworkAddress,
         reconfigure: bool,
+        disable_address_validation: bool,
     ) -> Result<Transaction, Error> {
+        if !disable_address_validation {
+            // Verify addresses
+            validate_address("validator address", &validator_address)?;
+            validate_address("fullnode address", &fullnode_address)?;
+        }
+
         let config = self.config()?;
         let mut storage = config.validator_backend();
 
@@ -66,33 +67,22 @@ impl ValidatorConfig {
         // and encrypt the validator address.
         let validator_address =
             validator_address.append_prod_protos(validator_network_key, HANDSHAKE_VERSION);
-        let raw_validator_address = encode_address(validator_address)?;
-        // Only supports one address for now
-        let key = TEST_SHARED_VAL_NETADDR_KEY;
-        let version = TEST_SHARED_VAL_NETADDR_KEY_VERSION;
-        let enc_validator_address = raw_validator_address.encrypt(
-            &key,
-            version,
-            &owner_account,
-            // This needs to be distinct, genesis = 0, post genesis sequence_number + 1
-            sequence_number + if reconfigure { 1 } else { 0 },
-            0, // addr_idx
-        );
-        let raw_enc_validator_address = RawEncNetworkAddress::try_from(&enc_validator_address)
+        let encryptor = config.validator_backend().encryptor();
+        let validator_addresses = encryptor
+            .encrypt(
+                &[validator_address],
+                owner_account,
+                sequence_number + if reconfigure { 1 } else { 0 },
+            )
             .map_err(|e| {
-                Error::UnexpectedError(format!(
-                    "error serializing encrypted address: '{:?}', error: {}",
-                    enc_validator_address, e
-                ))
+                Error::UnexpectedError(format!("Error encrypting validator address: {}", e))
             })?;
 
         // Build Fullnode address including protocols
         let fullnode_address =
             fullnode_address.append_prod_protos(fullnode_network_key, HANDSHAKE_VERSION);
-        let raw_fullnode_address = encode_address(fullnode_address)?;
 
         // Generate the validator config script
-        // TODO(philiphayes): remove network identity pubkey field from struct
         let transaction_callback = if reconfigure {
             transaction_builder::encode_set_validator_config_and_reconfigure_script
         } else {
@@ -101,10 +91,8 @@ impl ValidatorConfig {
         let validator_config_script = transaction_callback(
             owner_account,
             consensus_key.to_bytes().to_vec(),
-            validator_network_key.to_bytes(),
-            raw_enc_validator_address.into(),
-            fullnode_network_key.to_bytes(),
-            raw_fullnode_address.into(),
+            validator_addresses,
+            bcs::to_bytes(&vec![fullnode_address]).unwrap(),
         );
 
         // Create and sign the validator-config transaction
@@ -119,16 +107,6 @@ impl ValidatorConfig {
 
         Ok(txn)
     }
-}
-
-/// Encode an address into bytes
-fn encode_address(address: NetworkAddress) -> Result<RawNetworkAddress, Error> {
-    RawNetworkAddress::try_from(&address).map_err(|e| {
-        Error::UnexpectedError(format!(
-            "error serializing address: '{}', error: {}",
-            address, e
-        ))
-    })
 }
 
 /// Validates an address to have a DNS/IP and a port, as well as to be resolvable

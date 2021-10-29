@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module lays out the basic abstract costing schedule for bytecode instructions.
@@ -6,10 +6,13 @@
 //! It is important to note that the cost schedule defined in this file does not track hashing
 //! operations or other native operations; the cost of each native operation will be returned by the
 //! native function itself.
-use libra_types::{transaction::MAX_TRANSACTION_SIZE_IN_BYTES, vm_status::StatusCode};
 use mirai_annotations::*;
-use move_core_types::gas_schedule::{
-    AbstractMemorySize, CostTable, GasAlgebra, GasCarrier, GasConstants, GasCost, GasUnits,
+use move_core_types::{
+    gas_schedule::{
+        AbstractMemorySize, CostTable, GasAlgebra, GasCarrier, GasConstants, GasCost, GasUnits,
+        InternalGasUnits, MAX_TRANSACTION_SIZE_IN_BYTES,
+    },
+    vm_status::StatusCode,
 };
 use vm::{
     errors::{Location, PartialVMError, PartialVMResult, VMResult},
@@ -29,7 +32,7 @@ use vm::{
 /// Every client must use an instance of this type to interact with the Move VM.
 pub struct CostStrategy<'a> {
     cost_table: &'a CostTable,
-    gas_left: GasUnits<GasCarrier>,
+    gas_left: InternalGasUnits<GasCarrier>,
     charge: bool,
 }
 
@@ -40,7 +43,7 @@ impl<'a> CostStrategy<'a> {
     /// This is the instantiation that must be used when executing a user script.
     pub fn transaction(cost_table: &'a CostTable, gas_left: GasUnits<GasCarrier>) -> Self {
         Self {
-            gas_left: gas_left.map(|x| x * cost_table.gas_constants.gas_unit_scaling_factor),
+            gas_left: cost_table.gas_constants.to_internal_units(gas_left),
             cost_table,
             charge: true,
         }
@@ -52,7 +55,7 @@ impl<'a> CostStrategy<'a> {
     /// code that does not have to charge the user.
     pub fn system(cost_table: &'a CostTable, gas_left: GasUnits<GasCarrier>) -> Self {
         Self {
-            gas_left: gas_left.map(|x| x * cost_table.gas_constants.gas_unit_scaling_factor),
+            gas_left: cost_table.gas_constants.to_internal_units(gas_left),
             cost_table,
             charge: false,
         }
@@ -65,12 +68,13 @@ impl<'a> CostStrategy<'a> {
 
     /// Return the gas left.
     pub fn remaining_gas(&self) -> GasUnits<GasCarrier> {
-        self.gas_left
-            .map(|gas| gas / self.cost_table.gas_constants.gas_unit_scaling_factor)
+        self.cost_table
+            .gas_constants
+            .to_external_units(self.gas_left)
     }
 
     /// Charge a given amount of gas and fail if not enough gas units are left.
-    pub fn deduct_gas(&mut self, amount: GasUnits<GasCarrier>) -> PartialVMResult<()> {
+    pub fn deduct_gas(&mut self, amount: InternalGasUnits<GasCarrier>) -> PartialVMResult<()> {
         if !self.charge {
             return Ok(());
         }
@@ -82,7 +86,7 @@ impl<'a> CostStrategy<'a> {
             Ok(())
         } else {
             // Zero out the internal gas state
-            self.gas_left = GasUnits::new(0);
+            self.gas_left = InternalGasUnits::new(0);
             Err(PartialVMError::new(StatusCode::OUT_OF_GAS))
         }
     }
@@ -93,6 +97,9 @@ impl<'a> CostStrategy<'a> {
         opcode: Opcodes,
         size: AbstractMemorySize<GasCarrier>,
     ) -> PartialVMResult<()> {
+        // Make sure that the size is always non-zero
+        let size = size.map(|x| std::cmp::max(1, x));
+        debug_assert!(size.get() > 0);
         self.deduct_gas(
             self.cost_table
                 .instruction_cost(opcode as u8)
@@ -110,9 +117,9 @@ impl<'a> CostStrategy<'a> {
     /// gas units are left.
     pub fn charge_intrinsic_gas(
         &mut self,
-        instrinsic_cost: AbstractMemorySize<GasCarrier>,
+        intrinsic_cost: AbstractMemorySize<GasCarrier>,
     ) -> VMResult<()> {
-        let cost = calculate_intrinsic_gas(instrinsic_cost, &self.cost_table.gas_constants);
+        let cost = calculate_intrinsic_gas(intrinsic_cost, &self.cost_table.gas_constants);
         self.deduct_gas(cost)
             .map_err(|e| e.finish(Location::Undefined))
     }
@@ -274,13 +281,13 @@ pub fn zero_cost_schedule() -> CostTable {
 pub fn calculate_intrinsic_gas(
     transaction_size: AbstractMemorySize<GasCarrier>,
     gas_constants: &GasConstants,
-) -> GasUnits<GasCarrier> {
+) -> InternalGasUnits<GasCarrier> {
     precondition!(transaction_size.get() <= MAX_TRANSACTION_SIZE_IN_BYTES as GasCarrier);
     let min_transaction_fee = gas_constants.min_transaction_gas_units;
 
     if transaction_size.get() > gas_constants.large_transaction_cutoff.get() {
         let excess = transaction_size.sub(gas_constants.large_transaction_cutoff);
-        min_transaction_fee.add(gas_constants.instrinsic_gas_per_byte.mul(excess))
+        min_transaction_fee.add(gas_constants.intrinsic_gas_per_byte.mul(excess))
     } else {
         min_transaction_fee.unitary_cast()
     }
@@ -294,7 +301,7 @@ pub enum NativeCostIndex {
     SHA3_256 = 1,
     ED25519_VERIFY = 2,
     ED25519_THRESHOLD_VERIFY = 3,
-    LCS_TO_BYTES = 4,
+    BCS_TO_BYTES = 4,
     LENGTH = 5,
     EMPTY = 6,
     BORROW = 7,
@@ -307,4 +314,5 @@ pub enum NativeCostIndex {
     SIGNER_BORROW = 14,
     CREATE_SIGNER = 15,
     DESTROY_SIGNER = 16,
+    EMIT_EVENT = 17,
 }

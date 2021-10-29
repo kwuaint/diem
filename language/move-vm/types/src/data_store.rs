@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -41,5 +41,11 @@ pub trait DataStore {
     // ---
 
     /// Emit an event to the EventStore
-    fn emit_event(&mut self, guid: Vec<u8>, seq_num: u64, ty: Type, val: Value);
+    fn emit_event(
+        &mut self,
+        guid: Vec<u8>,
+        seq_num: u64,
+        ty: Type,
+        val: Value,
+    ) -> PartialVMResult<()>;
 }

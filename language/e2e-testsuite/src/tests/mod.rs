@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Test module.
@@ -14,9 +14,11 @@ mod account_universe;
 mod admin_script;
 mod create_account;
 mod data_store;
+mod emergency_admin_script;
 mod execution_strategies;
 mod failed_transaction_tests;
 mod genesis;
+mod genesis_initializations;
 mod mint;
 mod module_publishing;
 mod on_chain_configs;
@@ -30,3 +32,4 @@ mod validator_set_management;
 mod vasps;
 mod verify_txn;
 mod write_set;
+mod writeset_builder;

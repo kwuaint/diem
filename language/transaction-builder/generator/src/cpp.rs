@@ -1,8 +1,8 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::common;
-use libra_types::transaction::{ArgumentABI, ScriptABI, TypeArgumentABI};
+use diem_types::transaction::{ArgumentABI, ScriptABI, TypeArgumentABI};
 use move_core_types::language_storage::TypeTag;
 use serde_generate::indent::{IndentConfig, IndentedWriter};
 
@@ -72,7 +72,7 @@ pub fn output_library_body(
 struct CppEmitter<'a, T> {
     /// Writer.
     out: IndentedWriter<T>,
-    /// Name of the package owning the generated definitions (e.g. "com.facebook.my_package")
+    /// Name of the package owning the generated definitions (e.g. "com.my_org.my_package")
     namespace: Option<&'a str>,
     /// Whether function definitions should be prefixed with "inlined"
     inlined_definitions: bool,
@@ -87,7 +87,7 @@ where
             self.out,
             r#"#pragma once
 
-#include "libra_types.hpp"
+#include "diem_types.hpp"
 "#
         )
     }
@@ -97,7 +97,7 @@ where
             self.out,
             r#"
 using namespace serde;
-using namespace libra_types;
+using namespace diem_types;
 "#
         )
     }
@@ -117,7 +117,7 @@ using namespace libra_types;
     }
 
     fn output_builder_declaration(&mut self, abi: &ScriptABI) -> Result<()> {
-        write!(self.out, "\n{}", Self::quote_doc(abi.doc()))?;
+        self.output_doc(abi.doc())?;
         writeln!(
             self.out,
             "Script encode_{}_script({});",
@@ -134,7 +134,7 @@ using namespace libra_types;
 
     fn output_builder_definition(&mut self, abi: &ScriptABI) -> Result<()> {
         if self.inlined_definitions {
-            write!(self.out, "\n{}", Self::quote_doc(abi.doc()))?;
+            self.output_doc(abi.doc())?;
         }
         writeln!(
             self.out,
@@ -167,9 +167,10 @@ using namespace libra_types;
         Ok(())
     }
 
-    fn quote_doc(doc: &str) -> String {
+    fn output_doc(&mut self, doc: &str) -> Result<()> {
         let doc = crate::common::prepare_doc_string(doc);
-        textwrap::indent(&doc, "/// ").replace("\n\n", "\n///\n")
+        let text = textwrap::indent(&doc, "/// ").replace("\n\n", "\n///\n");
+        write!(self.out, "\n{}\n", text)
     }
 
     fn quote_type_parameters(ty_args: &[TypeArgumentABI]) -> Vec<String> {

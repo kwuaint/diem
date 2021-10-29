@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -7,7 +7,7 @@ use crate::{
     ReadSecretListResponse, ReadSecretMetadata, ReadSecretResponse, RenewTokenAuth,
     RenewTokenResponse, SealStatusResponse, Signature, SignatureResponse,
 };
-use libra_types::proptest_types::arb_json_value;
+use diem_types::proptest_types::arb_json_value;
 use proptest::prelude::*;
 use serde_json::Value;
 use ureq::Response;
@@ -74,7 +74,7 @@ prop_compose! {
     )(
         status in any::<u16>(),
         status_text in any::<String>(),
-        data in prop::collection::btree_map(any::<String>(), any::<String>(), 0..MAX_COLLECTION_SIZE),
+        data in prop::collection::btree_map(any::<String>(), arb_json_value(), 0..MAX_COLLECTION_SIZE),
         created_time in any::<String>(),
         version in any::<u32>(),
         secret in any::<String>(),

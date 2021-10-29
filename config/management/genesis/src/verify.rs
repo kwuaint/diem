@@ -1,22 +1,24 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use executor::db_bootstrapper;
-use libra_global_constants::{
+use diem_config::config::RocksdbConfig;
+use diem_global_constants::{
     CONSENSUS_KEY, FULLNODE_NETWORK_KEY, OPERATOR_ACCOUNT, OPERATOR_KEY, OWNER_ACCOUNT, OWNER_KEY,
     SAFETY_DATA, VALIDATOR_NETWORK_KEY, WAYPOINT,
 };
-use libra_management::{
+use diem_management::{
     config::ConfigPath, error::Error, secure_backend::ValidatorBackend,
     storage::StorageWrapper as Storage,
 };
-use libra_temppath::TempPath;
-use libra_types::{
+use diem_temppath::TempPath;
+use diem_types::{
     account_address::AccountAddress, account_config, account_state::AccountState,
-    on_chain_config::ValidatorSet, validator_config::ValidatorConfig, waypoint::Waypoint,
+    network_address::NetworkAddress, on_chain_config::ValidatorSet,
+    validator_config::ValidatorConfig, waypoint::Waypoint,
 };
-use libra_vm::LibraVM;
-use libradb::LibraDB;
+use diem_vm::DiemVM;
+use diemdb::DiemDB;
+use executor::db_bootstrapper;
 use std::{
     convert::TryFrom,
     fmt::Write,
@@ -75,7 +77,7 @@ impl Verify {
         write_break(&mut buffer);
 
         if let Some(genesis_path) = self.genesis_path.as_ref() {
-            compare_genesis(&validator_storage, &mut buffer, genesis_path)?;
+            compare_genesis(validator_storage, &mut buffer, genesis_path)?;
         }
 
         Ok(buffer)
@@ -118,12 +120,8 @@ fn write_string(storage: &Storage, buffer: &mut String, key: &'static str) {
 
 fn write_safety_data(storage: &Storage, buffer: &mut String, key: &'static str) {
     let value = storage
-        .value(key)
-        .map(|v| {
-            v.safety_data()
-                .map(|d| d.to_string())
-                .unwrap_or_else(|e| e.to_string())
-        })
+        .value::<consensus_types::safety_data::SafetyData>(key)
+        .map(|v| v.to_string())
         .unwrap_or_else(|e| e.to_string());
     writeln!(buffer, "{} - {}", key, value).unwrap();
 }
@@ -146,7 +144,7 @@ fn write_waypoint(storage: &Storage, buffer: &mut String, key: &'static str) {
 }
 
 fn compare_genesis(
-    storage: &Storage,
+    storage: Storage,
     buffer: &mut String,
     genesis_path: &PathBuf,
 ) -> Result<(), Error> {
@@ -162,27 +160,41 @@ fn compare_genesis(
     let validator_config = validator_config(validator_account, db_rw.reader.clone())?;
 
     let actual_consensus_key = storage.ed25519_public_from_private(CONSENSUS_KEY)?;
-    let expected_consensus_key = validator_config.consensus_public_key;
+    let expected_consensus_key = &validator_config.consensus_public_key;
     write_assert(
         buffer,
         CONSENSUS_KEY,
-        actual_consensus_key == expected_consensus_key,
+        &actual_consensus_key == expected_consensus_key,
     );
 
     let actual_validator_key = storage.x25519_public_from_private(VALIDATOR_NETWORK_KEY)?;
-    let expected_validator_key = validator_config.validator_network_identity_public_key;
+    let actual_fullnode_key = storage.x25519_public_from_private(FULLNODE_NETWORK_KEY)?;
+    let encryptor = storage.encryptor();
+
+    let expected_validator_key = encryptor
+        .decrypt(
+            &validator_config.validator_network_addresses,
+            validator_account,
+        )
+        .ok()
+        .and_then(|addrs| {
+            addrs
+                .get(0)
+                .and_then(|addr: &NetworkAddress| addr.find_noise_proto())
+        });
     write_assert(
         buffer,
         VALIDATOR_NETWORK_KEY,
-        actual_validator_key == expected_validator_key,
+        Some(actual_validator_key) == expected_validator_key,
     );
 
-    let actual_fullnode_key = storage.x25519_public_from_private(FULLNODE_NETWORK_KEY)?;
-    let expected_fullnode_key = validator_config.full_node_network_identity_public_key;
+    let expected_fullnode_key = validator_config.fullnode_network_addresses().ok().and_then(
+        |addrs: Vec<NetworkAddress>| addrs.get(0).and_then(|addr| addr.find_noise_proto()),
+    );
     write_assert(
         buffer,
         FULLNODE_NETWORK_KEY,
-        actual_fullnode_key == expected_fullnode_key,
+        Some(actual_fullnode_key) == expected_fullnode_key,
     );
 
     Ok(())
@@ -194,21 +206,21 @@ fn compute_genesis(
     genesis_path: &PathBuf,
     db_path: &Path,
 ) -> Result<(DbReaderWriter, Waypoint), Error> {
-    let libradb =
-        LibraDB::open(db_path, false, None).map_err(|e| Error::UnexpectedError(e.to_string()))?;
-    let db_rw = DbReaderWriter::new(libradb);
+    let diemdb = DiemDB::open(db_path, false, None, RocksdbConfig::default())
+        .map_err(|e| Error::UnexpectedError(e.to_string()))?;
+    let db_rw = DbReaderWriter::new(diemdb);
 
     let mut file = File::open(genesis_path)
         .map_err(|e| Error::UnexpectedError(format!("Unable to open genesis file: {}", e)))?;
     let mut buffer = vec![];
     file.read_to_end(&mut buffer)
         .map_err(|e| Error::UnexpectedError(format!("Unable to read genesis: {}", e)))?;
-    let genesis = lcs::from_bytes(&buffer)
+    let genesis = bcs::from_bytes(&buffer)
         .map_err(|e| Error::UnexpectedError(format!("Unable to parse genesis: {}", e)))?;
 
-    let waypoint = db_bootstrapper::generate_waypoint::<LibraVM>(&db_rw, &genesis)
+    let waypoint = db_bootstrapper::generate_waypoint::<DiemVM>(&db_rw, &genesis)
         .map_err(|e| Error::UnexpectedError(e.to_string()))?;
-    db_bootstrapper::maybe_bootstrap::<LibraVM>(&db_rw, &genesis, waypoint)
+    db_bootstrapper::maybe_bootstrap::<DiemVM>(&db_rw, &genesis, waypoint)
         .map_err(|e| Error::UnexpectedError(format!("Unable to commit genesis: {}", e)))?;
 
     Ok((db_rw, waypoint))

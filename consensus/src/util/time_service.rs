@@ -1,16 +1,12 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use diem_logger::prelude::*;
 use futures::{Future, FutureExt, SinkExt};
-use libra_logger::prelude::*;
-use std::{
-    pin::Pin,
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{pin::Pin, thread, time::Duration};
 
 use crate::counters;
-use tokio::{runtime::Handle, time::delay_for};
+use tokio::{runtime::Handle, time::sleep};
 
 /// Time service is an abstraction for operations that depend on time
 /// It supports implementations that can simulated time or depend on actual time
@@ -112,24 +108,17 @@ impl ClockTimeService {
 impl TimeService for ClockTimeService {
     fn run_after(&self, timeout: Duration, mut t: Box<dyn ScheduledTask>) {
         let task = async move {
-            delay_for(timeout).await;
+            sleep(timeout).await;
             t.run().await;
         };
         self.executor.spawn(task);
     }
 
     fn get_current_timestamp(&self) -> Duration {
-        duration_since_epoch()
+        diem_infallible::duration_since_epoch()
     }
 
     fn sleep(&self, t: Duration) {
         thread::sleep(t)
     }
-}
-
-/// Return the duration since the UNIX_EPOCH
-pub fn duration_since_epoch() -> Duration {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Timestamp generated is before the UNIX_EPOCH!")
 }

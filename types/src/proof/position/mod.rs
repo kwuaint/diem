@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module provides an abstraction for positioning a node in a binary tree,
@@ -24,6 +24,7 @@
 //! Note3: The leaf index starting from left-most leaf, starts from 0
 
 use crate::proof::definition::{LeafCount, MAX_ACCUMULATOR_LEAVES, MAX_ACCUMULATOR_PROOF_DEPTH};
+use anyhow::{ensure, Result};
 use mirai_annotations::*;
 use std::fmt;
 
@@ -60,10 +61,10 @@ impl Position {
 
     /// pos count start from 0 on each level
     pub fn from_level_and_pos(level: u32, pos: u64) -> Self {
-        precondition!(level < 63);
+        precondition!(level < 64);
         assume!(1u64 << level > 0); // bitwise and integer operations don't mix.
         let level_one_bits = (1u64 << level) - 1;
-        let shifted_pos = pos << (level + 1);
+        let shifted_pos = if level == 63 { 0 } else { pos << (level + 1) };
         Position(shifted_pos | level_one_bits)
     }
 
@@ -75,8 +76,13 @@ impl Position {
         self.0
     }
 
-    pub fn from_postorder_index(index: u64) -> Self {
-        Position(postorder_to_inorder(index))
+    pub fn from_postorder_index(index: u64) -> Result<Self> {
+        ensure!(
+            index < !0u64,
+            "node index {} is invalid (equal to 2^64 - 1)",
+            index
+        );
+        Ok(Position(postorder_to_inorder(index)))
     }
 
     pub fn to_postorder_index(self) -> u64 {
@@ -210,7 +216,7 @@ fn smear_ones_for_u64(v: u64) -> u64 {
 ///     00010010000 n=3
 /// ```
 fn turn_off_right_most_n_bits(v: u64, n: u32) -> u64 {
-    precondition!(n < 64);
+    debug_checked_precondition!(n < 64);
     (v >> n) << n
 }
 
@@ -227,7 +233,7 @@ fn turn_off_right_most_n_bits(v: u64, n: u32) -> u64 {
 /// ```
 /// http://www.catonmat.net/blog/low-level-bit-hacks-you-absolutely-must-know/
 fn isolate_rightmost_zero_bit(v: u64) -> u64 {
-    !v & (v + 1)
+    !v & v.overflowing_add(1).0
 }
 
 // The following part of the position implementation is logically separate and

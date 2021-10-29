@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -11,7 +11,8 @@ use crate::{
     },
 };
 use anyhow::{anyhow, ensure, Result};
-use libra_types::{ledger_info::LedgerInfoWithSignatures, waypoint::Waypoint};
+use diem_logger::prelude::*;
+use diem_types::{ledger_info::LedgerInfoWithSignatures, waypoint::Waypoint};
 use once_cell::sync::Lazy;
 use std::{convert::TryInto, str::FromStr, sync::Arc};
 use structopt::StructOpt;
@@ -54,15 +55,16 @@ impl EpochEndingBackupController {
     }
 
     pub async fn run(self) -> Result<FileHandle> {
-        println!(
+        info!(
             "Epoch ending backup started, starting from epoch {}, unill epoch {} (excluded).",
-            self.start_epoch, self.end_epoch,
+            start_epoch = self.start_epoch,
+            end_epoch = self.end_epoch,
         );
         let ret = self
             .run_impl()
             .await
             .map_err(|e| anyhow!("Epoch ending backup failed: {}", e))?;
-        println!("Epoch ending backup succeeded. Manifest: {}", ret);
+        info!("Epoch ending backup succeeded. Manifest: {}", ret);
         Ok(ret)
     }
 }
@@ -136,7 +138,7 @@ impl EpochEndingBackupController {
     }
 
     fn get_waypoint(record: &[u8], epoch: u64) -> Result<Waypoint> {
-        let li: LedgerInfoWithSignatures = lcs::from_bytes(record)?;
+        let li: LedgerInfoWithSignatures = bcs::from_bytes(record)?;
         ensure!(
             li.ledger_info().epoch() == epoch,
             "Epoch not expected. expected: {}, actual: {}.",
@@ -158,6 +160,7 @@ impl EpochEndingBackupController {
             .create_for_write(backup_handle, &Self::chunk_name(first_epoch))
             .await?;
         chunk_file.write_all(&chunk_bytes).await?;
+        chunk_file.shutdown().await?;
         Ok(EpochEndingChunk {
             first_epoch,
             last_epoch,
@@ -187,6 +190,7 @@ impl EpochEndingBackupController {
         manifest_file
             .write_all(&serde_json::to_vec(&manifest)?)
             .await?;
+        manifest_file.shutdown().await?;
 
         let metadata = Metadata::new_epoch_ending_backup(
             first_epoch,

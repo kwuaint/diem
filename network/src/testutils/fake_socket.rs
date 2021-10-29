@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //!
@@ -24,8 +24,8 @@ use std::{io, pin::Pin};
 pub struct ReadOnlyTestSocket<'a> {
     /// the content
     content: &'a [u8],
-    /// the socket will read byte-by-byte
-    fragmented: bool,
+    /// fragment reads byte-by-byte
+    fragmented_read: bool,
     /// continue to read 0s once content has been fully read
     trailing: bool,
 }
@@ -34,19 +34,17 @@ impl<'a> ReadOnlyTestSocket<'a> {
     pub fn new(content: &'a [u8]) -> Self {
         Self {
             content,
-            fragmented: false,
+            fragmented_read: false,
             trailing: false,
         }
     }
 
-    /// reads will have to be done byte by byte
-    #[allow(dead_code)]
+    /// reads will be done byte-by-byte
     pub fn set_fragmented_read(&mut self) {
-        self.fragmented = true;
+        self.fragmented_read = true;
     }
 
     /// reads will never return pending, but 0s
-    #[allow(dead_code)]
     pub fn set_trailing(&mut self) {
         self.trailing = true;
     }
@@ -77,8 +75,15 @@ impl<'a> AsyncRead for ReadOnlyTestSocket<'a> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         mut _context: &mut Context,
-        buf: &mut [u8],
+        mut buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
+        // read/recv on an empty buffer is underspecified
+        assert!(!buf.is_empty());
+
+        if self.fragmented_read {
+            buf = &mut buf[..1];
+        }
+
         // nothing left to read
         if self.content.is_empty() {
             if self.trailing {
@@ -93,28 +98,108 @@ impl<'a> AsyncRead for ReadOnlyTestSocket<'a> {
             }
         }
 
-        // if something left return what's asked
-        if self.fragmented {
-            // read only one byte
-            let (read, content) = self.content.split_at(1);
-            buf[0] = read[0];
+        // read as much as we can
+        let to_read = std::cmp::min(buf.len(), self.content.len());
+        buf[..to_read].copy_from_slice(&self.content[..to_read]);
 
-            // update internal state
-            self.content = content;
+        // update internal buffer
+        self.content = &self.content[to_read..self.content.len()];
 
-            // return 1 byte
-            Poll::Ready(Ok(1))
-        } else {
-            // read as much as we can
-            let to_read = std::cmp::min(buf.len(), self.content.len());
-            buf[..to_read].copy_from_slice(&self.content[..to_read]);
+        Poll::Ready(Ok(to_read))
+    }
+}
 
-            // update internal state
-            self.content = &self.content[to_read..self.content.len()];
+//
+// ReadOnlyTestSocket but with a static lifetime (useful to really replace a socket)
+//
 
-            // return length read
-            Poll::Ready(Ok(to_read))
+#[derive(Debug)]
+pub struct ReadOnlyTestSocketVec {
+    /// the content
+    content: Vec<u8>,
+    /// fragment reads byte-by-byte
+    fragmented_read: bool,
+    /// continue to read 0s once content has been fully read
+    trailing: bool,
+}
+
+impl ReadOnlyTestSocketVec {
+    pub fn new(content: Vec<u8>) -> Self {
+        Self {
+            content,
+            fragmented_read: false,
+            trailing: false,
         }
+    }
+
+    /// reads will be done byte-by-byte
+    #[allow(dead_code)]
+    pub fn set_fragmented_read(&mut self) {
+        self.fragmented_read = true;
+    }
+
+    /// reads will never return pending, but 0s
+    pub fn set_trailing(&mut self) {
+        self.trailing = true;
+    }
+}
+
+/// Does nothing, but looks to the caller as if write worked
+impl AsyncWrite for ReadOnlyTestSocketVec {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _context: &mut Context,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    /// Attempt to close the channel. Cannot Fail.
+    fn poll_close(self: Pin<&mut Self>, _context: &mut Context) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Read based on the mode set
+impl AsyncRead for ReadOnlyTestSocketVec {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        mut _context: &mut Context,
+        mut buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        // read/recv on an empty buffer is underspecified
+        assert!(!buf.is_empty());
+
+        if self.fragmented_read {
+            buf = &mut buf[..1];
+        }
+
+        // nothing left to read
+        if self.content.is_empty() {
+            if self.trailing {
+                // [0, 0, 0, 0, ...]
+                for val in buf.iter_mut() {
+                    *val = 0;
+                }
+                return Poll::Ready(Ok(buf.len()));
+            } else {
+                // EOF
+                return Poll::Ready(Ok(0));
+            }
+        }
+
+        // read as much as we can
+        let to_read = std::cmp::min(buf.len(), self.content.len());
+        buf[..to_read].copy_from_slice(&self.content[..to_read]);
+
+        // update internal buffer
+        self.content = self.content.split_off(to_read);
+
+        Poll::Ready(Ok(to_read))
     }
 }
 
@@ -129,8 +214,10 @@ pub struct ReadWriteTestSocket<'a> {
     inner: MemorySocket,
     /// useful to save what was written on the socket
     written: Option<&'a mut Vec<u8>>,
-    /// fragment reads byte by byte
-    fragmented: bool,
+    /// fragment reads byte-by-byte
+    fragmented_read: bool,
+    /// fragment writes byte-by-byte
+    fragmented_write: bool,
 }
 
 impl<'a> ReadWriteTestSocket<'a> {
@@ -138,7 +225,8 @@ impl<'a> ReadWriteTestSocket<'a> {
         Self {
             inner: memory_socket,
             written: None,
-            fragmented: false,
+            fragmented_read: false,
+            fragmented_write: false,
         }
     }
 
@@ -147,10 +235,14 @@ impl<'a> ReadWriteTestSocket<'a> {
         self.written = Some(buf);
     }
 
-    /// reads will have to be done byte by byte
-    #[allow(dead_code)]
+    /// reads will be done byte-by-byte
     pub fn set_fragmented_read(&mut self) {
-        self.fragmented = true;
+        self.fragmented_read = true;
+    }
+
+    /// writes will be done byte-by-byte
+    pub fn set_fragmented_write(&mut self) {
+        self.fragmented_write = true;
     }
 
     /// Creates a new pair of sockets
@@ -167,12 +259,20 @@ impl<'a> AsyncWrite for ReadWriteTestSocket<'a> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         context: &mut Context,
-        buf: &[u8],
+        mut buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if self.fragmented_write {
+            buf = &buf[..1];
+        }
+
+        // write buf
         let bytes_written = ready!(Pin::new(&mut self.inner).poll_write(context, buf))?;
+
+        // record write if needed
         if let Some(v) = self.written.as_mut() {
             v.extend_from_slice(&buf[..bytes_written])
         }
+
         Poll::Ready(Ok(bytes_written))
     }
 
@@ -190,21 +290,16 @@ impl<'a> AsyncRead for ReadWriteTestSocket<'a> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         context: &mut Context,
-        buf: &mut [u8],
+        mut buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        // read from inner sockets
-        if self.fragmented {
-            // fragmented: read only one byte
-            let mut buf_byte = [0u8];
-            let poll_res = Pin::new(&mut self.inner).poll_read(context, &mut buf_byte);
-            if poll_res.is_ready() {
-                buf[0] = buf_byte[0];
-            }
-            poll_res
-        } else {
-            // read normally
-            Pin::new(&mut self.inner).poll_read(context, buf)
+        // read/recv on an empty buffer is underspecified
+        assert!(!buf.is_empty());
+
+        if self.fragmented_read {
+            buf = &mut buf[..1];
         }
+
+        Pin::new(&mut self.inner).poll_read(context, buf)
     }
 }
 
@@ -218,6 +313,7 @@ mod tests {
     use super::*;
     use futures::{
         executor::block_on,
+        future,
         io::{AsyncReadExt, AsyncWriteExt},
     };
 
@@ -247,6 +343,35 @@ mod tests {
                 assert!(buf[0] == i);
             }
         });
+    }
+
+    #[test]
+    fn test_fragmented_writes() {
+        let (mut tx, mut rx) = ReadWriteTestSocket::new_pair();
+        let mut tx_writes = Vec::new();
+        tx.set_fragmented_write();
+        tx.save_writing(&mut tx_writes);
+
+        let msg = b"12345";
+        let f_write = async {
+            for i in 0..msg.len() {
+                let write = tx.write(&msg[i..]).await.unwrap();
+                assert_eq!(write, 1);
+                // satisfy borrow checker...
+                let tx_writes = tx.written.as_ref().unwrap();
+                assert_eq!(&tx_writes[..], &msg[..i + 1]);
+            }
+            tx.close().await.unwrap();
+        };
+
+        let f_read = async {
+            let mut read_buf = Vec::new();
+            let read = rx.read_to_end(&mut read_buf).await.unwrap();
+            assert_eq!(read, msg.len());
+            assert_eq!(&read_buf[..], &msg[..]);
+        };
+
+        block_on(future::join(f_write, f_read));
     }
 
     #[test]
