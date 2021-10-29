@@ -889,7 +889,7 @@ dependencies = [
  "generate-key",
  "hex",
  "itertools 0.10.0",
- "k8s-openapi",
+ "k8s-openapi 0.13.1",
  "kube",
  "network",
  "network-builder",
@@ -3828,6 +3828,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "k8s-openapi"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f8de9873b904e74b3533f77493731ee26742418077503683db44e1b3c54aa5c"
+dependencies = [
+ "base64",
+ "bytes",
+ "chrono",
+ "serde",
+ "serde-value",
+ "serde_json",
+]
+
+[[package]]
 name = "keccak"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3851,7 +3865,7 @@ dependencies = [
  "hyper-timeout",
  "hyper-tls",
  "jsonpath_lib",
- "k8s-openapi",
+ "k8s-openapi 0.11.0",
  "log",
  "openssl",
  "pem",
