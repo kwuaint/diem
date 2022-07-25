@@ -10,7 +10,7 @@ publish = false
 edition = "2018"
 
 [dependencies]
-crossbeam = "0.8.0"
+crossbeam = "0.8.2"
 diem-workspace-hack = { path = "../workspace-hack" }
 proptest = "1.0.0"
 proptest-derive = "0.3.0"
